@@ -30,3 +30,14 @@ else
 endif
 
 include $(BUILD_STATIC_LIBRARY)
+
+# gerrit comment:
+# what kind of apps would want to use this?
+# Minimal UI for factory test mode where we want to boot up in <10s and have factory line go through basic hardware testing (factory test itself is being discussed in https://android-review.googlesource.com/#/c/130000/)
+# ps2 adds a motivating code comment so we don't just immediately remove this unused library.
+# Used by OEMs for factory test images.
+include $(CLEAR_VARS)
+LOCAL_MODULE := libminui
+LOCAL_WHOLE_STATIC_LIBRARIES += libminui
+LOCAL_SHARED_LIBRARIES := libpng
+include $(BUILD_SHARED_LIBRARY)
