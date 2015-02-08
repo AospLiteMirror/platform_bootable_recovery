@@ -141,7 +141,6 @@ static bool resizeHash(HashTable* pHashTable, int newSize)
     int i;
 
     assert(countTombStones(pHashTable) == pHashTable->numDeadEntries);
-    //LOGI("before: dead=%d\n", pHashTable->numDeadEntries);
 
     pNewEntries = (HashEntry*) calloc(newSize, sizeof(HashTable));
     if (pNewEntries == NULL)
@@ -197,7 +196,6 @@ void* mzHashTableLookup(HashTable* pHashTable, unsigned int itemHash, void* item
             (*cmpFunc)(pEntry->data, item) == 0)
         {
             /* match */
-            //LOGD("+++ match on entry %d\n", pEntry - pHashTable->pEntries);
             break;
         }
 
@@ -207,8 +205,6 @@ void* mzHashTableLookup(HashTable* pHashTable, unsigned int itemHash, void* item
                 break;      /* edge case - single-entry table */
             pEntry = pHashTable->pEntries;
         }
-
-        //LOGI("+++ look probing %d...\n", pEntry - pHashTable->pEntries);
     }
 
     if (pEntry->data == NULL) {
@@ -229,10 +225,6 @@ void* mzHashTableLookup(HashTable* pHashTable, unsigned int itemHash, void* item
                     abort();
                 }
                 /* note "pEntry" is now invalid */
-            } else {
-                //LOGW("okay %d/%d/%d\n",
-                //    pHashTable->numEntries, pHashTable->tableSize,
-                //    (pHashTable->tableSize * LOAD_NUMER) / LOAD_DENOM);
             }
 
             /* full table is bad -- search for nonexistent never halts */
@@ -265,7 +257,6 @@ bool mzHashTableRemove(HashTable* pHashTable, unsigned int itemHash, void* item)
     pEnd = &pHashTable->pEntries[pHashTable->tableSize];
     while (pEntry->data != NULL) {
         if (pEntry->data == item) {
-            //LOGI("+++ stepping on entry %d\n", pEntry - pHashTable->pEntries);
             pEntry->data = HASH_TOMBSTONE;
             pHashTable->numEntries--;
             pHashTable->numDeadEntries++;
@@ -278,8 +269,6 @@ bool mzHashTableRemove(HashTable* pHashTable, unsigned int itemHash, void* item)
                 break;      /* edge case - single-entry table */
             pEntry = pHashTable->pEntries;
         }
-
-        //LOGI("+++ del probing %d...\n", pEntry - pHashTable->pEntries);
     }
 
     return false;
