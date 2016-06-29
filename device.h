@@ -21,7 +21,9 @@
 
 class Device {
   public:
-    Device(RecoveryUI* ui) : ui_(ui) { }
+    // explicit关键字只能用于修饰只有一个参数的类构造函数, 它的作用是表明该构造函数是显示的, 而非隐式的
+    // 如果想禁止类A对象被隐式转换为类B对象，可在类B中使用关键字explicit
+    explicit Device(RecoveryUI* ui) : ui_(ui) { }
     virtual ~Device() { }
 
     // Called to obtain the UI object that should be used to display
