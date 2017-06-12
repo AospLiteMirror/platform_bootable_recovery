@@ -75,6 +75,7 @@ LOCAL_SRC_FILES := \
     screen_ui.cpp \
     ui.cpp \
     verifier.cpp \
+    vr_ui.cpp \
     wear_ui.cpp \
     wear_touch.cpp \
 
@@ -181,6 +182,17 @@ LOCAL_STATIC_LIBRARIES := \
     libcrypto \
     libbase
 LOCAL_CFLAGS := -Werror
+include $(BUILD_STATIC_LIBRARY)
+
+# vr headset default device
+# ===============================
+include $(CLEAR_VARS)
+
+LOCAL_SRC_FILES := vr_device.cpp
+
+# should match TARGET_RECOVERY_UI_LIB set in BoardConfig.mk
+LOCAL_MODULE := librecovery_ui_vr
+
 include $(BUILD_STATIC_LIBRARY)
 
 include \
