@@ -105,7 +105,7 @@ int FillBuffer(unsigned char* buffer, int size, bz_stream* stream) {
 // source_to_use->size -- source实际数据的大小
 // patch -- 代表patch的数据机构object
 // 0  -- patch_offset
-// sink -- ApplyBSDiffPatch中在内存中生成了target的数据, 然后调用sink按对文件还是分区打patch的不同方式保存这些数据
+// sink -- ApplyBSDiffPatchMem中在内存中生成了target的数据, 然后调用sink按对文件还是分区打patch的不同方式保存这些数据
 // token -- 最终输出生成target数据的地址
 int ApplyBSDiffPatch(const unsigned char* old_data, ssize_t old_size,
                      const Value* patch, ssize_t patch_offset,
@@ -119,8 +119,12 @@ int ApplyBSDiffPatch(const unsigned char* old_data, ssize_t old_size,
         return -1;
     }
 
-	//通过sink调用传入的函数指针,对于分区就是applypatch.c中的MemorySink,对于文件就是FileSink
+	//通过sink调用传入的函数指针
+	// GenerateTarget中调用ApplyBSDiffPatch时传入的函数指针sink,对于分区就是applypatch.c中的MemorySink函数,对于文件就是FileSink函数
+	// BlockImageUpdateFn中调用ApplyBSDiffPatch时传入的函数指针sink指向的是函数RangeSinkWrite
+	// RangeSinkWrite,MemorySink,FileSink都返回已经写入的数据的大小
     if (sink(new_data, new_size, token) < new_size) {
+        // 如果返回值<new_size,说明写少了
         printf("short write of output: %d (%s)\n", errno, strerror(errno));
         return 1;
     }

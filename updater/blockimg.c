@@ -54,6 +54,8 @@ typedef struct {
     int pos[0];
 } RangeSet;
 
+//在BlockImageUpdateFn中的调用情况为:  RangeSet* tgt = parse_range(word);
+//这时word指向的是 30,32770,32825,32827,33307,65535,65536,65538,66018,98303,98304,98306,98361,98363,98843,131071,131072,131074,131554,162907,163840,163842,16///3897,163899,164379,196607,196608,196610,197090,215039,215040
 static RangeSet* parse_range(char* text) {
     char* save;
     int num;
@@ -80,44 +82,80 @@ static RangeSet* parse_range(char* text) {
     return out;
 }
 
-static void readblock(int fd, uint8_t* data, size_t size) {
+static int range_overlaps(RangeSet* r1, RangeSet* r2) {
+    int i, j, r1_0, r1_1, r2_0, r2_1;
+
+    if (!r1 || !r2) {
+        return 0;
+    }
+
+    for (i = 0; i < r1->count; ++i) {
+        r1_0 = r1->pos[i * 2];
+        r1_1 = r1->pos[i * 2 + 1];
+
+        for (j = 0; j < r2->count; ++j) {
+            r2_0 = r2->pos[j * 2];
+            r2_1 = r2->pos[j * 2 + 1];
+
+            if (!(r2_0 > r1_1 || r1_0 > r2_1)) {
+                return 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+// 读取文件描述符fd指向数据到data,读取大小为size.成功返回0,失败返回-1
+static int read_all(int fd, uint8_t* data, size_t size) {
     size_t so_far = 0;
     while (so_far < size) {
         ssize_t r = read(fd, data+so_far, size-so_far);
         if (r < 0 && errno != EINTR) {
             fprintf(stderr, "read failed: %s\n", strerror(errno));
-            return;
+            return -1;
         } else {
             so_far += r;
         }
     }
+    return 0;
 }
 
-static void writeblock(int fd, const uint8_t* data, size_t size) {
+// 将data指向的大小为size的数据写入fd,成功返回0,失败返回-1
+static int write_all(int fd, const uint8_t* data, size_t size) {
     size_t written = 0;
     while (written < size) {
         ssize_t w = write(fd, data+written, size-written);
         if (w < 0 && errno != EINTR) {
             fprintf(stderr, "write failed: %s\n", strerror(errno));
-            return;
+            return -1;
         } else {
             written += w;
         }
     }
+
+    if (fsync(fd) == -1) {
+        fprintf(stderr, "fsync failed: %s\n", strerror(errno));
+        return -1;
+    }
+
+    return 0;
 }
 
-static void check_lseek(int fd, off64_t offset, int whence) {
+// 成功返回0,失败返回-1
+static int check_lseek(int fd, off64_t offset, int whence) {
     while (true) {
         off64_t ret = lseek64(fd, offset, whence);
         if (ret < 0) {
             if (errno != EINTR) {
                 fprintf(stderr, "lseek64 failed: %s\n", strerror(errno));
-                exit(1);
+                return -1;
             }
         } else {
             break;
         }
     }
+    return 0;
 }
 
 static void allocate(size_t size, uint8_t** buffer, size_t* buffer_alloc) {
@@ -141,32 +179,50 @@ typedef struct {
     size_t p_remain;
 } RangeSinkState;
 
+// RangeSinkWrite 相对于函数FileSink和MemorySink,是将一个区间段数据写入闪存
+// 1 在BlockImageUpdateFn中执行transfer.list中的imgdiff或bsdiff命令时,调用ApplyImagePatch或ApplyBSDiffPatch时传入的sink函数指针
+// 2 receive_new_data中直接调用
+// data -- 要写入的数据的起始地址
+// size -- 要写入的数据大小
+// token -- 
 static ssize_t RangeSinkWrite(const uint8_t* data, ssize_t size, void* token) {
     RangeSinkState* rss = (RangeSinkState*) token;
 
+    // 对于BlockImageUpdateFn中的调用,	RangeSinkState rss; rss.p_remain = (tgt->pos[1] - tgt->pos[0]) * BLOCKSIZE;
+    // RangeSinkState的p_remain代表剩余要从内存写入闪存的数据大小
     if (rss->p_remain <= 0) {
         fprintf(stderr, "range sink write overrun");
-        exit(1);
+        return 0;
     }
 
+    // written代表已经写入的数据的大小
     ssize_t written = 0;
     while (size > 0) {
+        // write_now代表剩余要写入的大小
         size_t write_now = size;
         if (rss->p_remain < write_now) write_now = rss->p_remain;
+        // 写入write_now大小的数据
         writeblock(rss->fd, data, write_now);
+        // 移动要写入的should地址
         data += write_now;
         size -= write_now;
 
         rss->p_remain -= write_now;
+        // 写入完后已经写入数据大小written要加上write_now
         written += write_now;
 
         if (rss->p_remain == 0) {
             // move to the next block
+            // RangeSinkState的p_block表示已写入的block区段的个数
+            // 因此如果p_remain为0就说明一个区段内的block均已更新,这时p_block就要+1
             ++rss->p_block;
+            // 如果p_block<总区段个数,就继续更新下一个block区间
             if (rss->p_block < rss->tgt->count) {
                 rss->p_remain = (rss->tgt->pos[rss->p_block*2+1] - rss->tgt->pos[rss->p_block*2]) * BLOCKSIZE;
+                // 调用check_lseek,将读写位置指向下一个block区间其实位置
                 check_lseek(rss->fd, (off64_t)rss->tgt->pos[rss->p_block*2] * BLOCKSIZE, SEEK_SET);
             } else {
+                // 说明已经更新完所有block区间, 返回已经写入的数据的大小
                 // we can't write any more; return how many bytes have
                 // been written so far.
                 return written;
