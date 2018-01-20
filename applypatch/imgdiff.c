@@ -38,6 +38,8 @@
  * "minigzip" tool included in the zlib distribution, not the GNU gzip
  * program.
  *
+ // 对于一个imgdiff命令要处理的IMGDIFF格式补丁文件或补丁数据,它里面又包含1个文件头,之后是chunk count个bsdiff格式的补丁
+ // 文件头中包含chunk count的大小,描述了这个补丁整体的chunk结构
  * An "imgdiff" patch consists of a header describing the chunk structure
  * of the file and any encoding parameters needed for the gzipped
  * chunks, followed by N bsdiff patches, one per chunk.
@@ -59,6 +61,9 @@
  * occur spuriously within a normal chunk to be a problem.)
  *
  *
+ // 下面的表格仅仅描述的是IMGDIFF格式补丁文件或补丁数据的文件头的格式
+ // chunk count字段后又有chunk count个chunk自身的头
+ // 每个chunk头包含哪些字段根据此chunk的type决定
  * The imgdiff patch header looks like this:
  *
  *    "IMGDIFF1"                  (8)   [magic number and version]
@@ -109,6 +114,9 @@
  * compressed data to create the output chunk (so that header contents
  * like the timestamp are recreated exactly).
  *
+ // 整个imgdiff文件或数据流的文件头完了之后就是chunk count个bsdiff格式的patch
+ // 每个bsdiff格式patch相对imgdiff文件或数据流开始的偏移,在此patch在整个文件头中
+ // 对应的chunk中定义
  * After the header there are 'chunk count' bsdiff patches; the offset
  * of each from the beginning of the file is specified in the header.
  *

@@ -82,7 +82,7 @@ int ApplyImagePatch(const unsigned char* old_data, ssize_t old_size __unused,
     int num_chunks = Read4(header+8);
 
     int i;
-    // ApplyImagePatch之后就都是在for中循环处理每一个chunk
+    // ApplyImagePatch之后就都是在for中循环处理补丁数据中每一个chunk
     // 对每个chunk,都是先读出开头4字节的chunk type,然后根据chunk type不同类型在不同条件分支中处理
     for (i = 0; i < num_chunks; ++i) {
         // each chunk's header record starts with 4 bytes.
@@ -95,6 +95,7 @@ int ApplyImagePatch(const unsigned char* old_data, ssize_t old_size __unused,
         pos += 4;
 
         if (type == CHUNK_NORMAL) {
+            // normal_header就是CHUNK_NORMAL类型的chunk自身的头的起始地址
             char* normal_header = patch->data + pos;
             pos += 24;
             if (pos > patch->size) {
@@ -102,13 +103,20 @@ int ApplyImagePatch(const unsigned char* old_data, ssize_t old_size __unused,
                 return -1;
             }
 
+            // 对于CHUNK_NORMAL类型的chunk(厚块)
+            // 补丁数据中chunk type后8+8字节src_start,src_len指定了压缩出这个chunk的源image的section位置
+            // 对于imgdiff命令,源image就是现在升级前android的system分区,因此src_start要和old_data相加才有意义
+            // src_start和src_len都是对old_data指向的数据而言的
             size_t src_start = Read8(normal_header);
             size_t src_len = Read8(normal_header+8);
+            // patch_offset就是此chunk在整个imgdiff patch的文件头后对应的bsdiff patch格式的数据,
+            // 相对整个imgdiff patch的偏移
             size_t patch_offset = Read8(normal_header+16);
 
             ApplyBSDiffPatch(old_data + src_start, src_len,
                              patch, patch_offset, sink, token, ctx);
         } else if (type == CHUNK_RAW) {
+            // raw_header就是CHUNK_RAW类型的chunk自身的头的起始地址
             char* raw_header = patch->data + pos;
             pos += 4;
             if (pos > patch->size) {
@@ -116,6 +124,7 @@ int ApplyImagePatch(const unsigned char* old_data, ssize_t old_size __unused,
                 return -1;
             }
 
+            // 从raw_header开始读取4字节,读到的就是target len
             ssize_t data_len = Read4(raw_header);
 
             if (pos + data_len > patch->size) {
@@ -123,6 +132,8 @@ int ApplyImagePatch(const unsigned char* old_data, ssize_t old_size __unused,
                 return -1;
             }
             if (ctx) SHA_update(ctx, patch->data + pos, data_len);
+            // RAW类型的chunk保存的是target中的数据,因此可以直接写入
+            // 将patch->data + pos,也就是raw_header+4开始的target data数据直接写入flash
             if (sink((unsigned char*)patch->data + pos,
                      data_len, token) != data_len) {
                 printf("failed to write chunk %d raw data\n", i);
