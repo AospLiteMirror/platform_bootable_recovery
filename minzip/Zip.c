@@ -512,20 +512,24 @@ static bool processDeflatedEntry(const ZipArchive *pArchive,
     long result = -1;
     unsigned char readBuf[32 * 1024];
     unsigned char procBuf[32 * 1024];
+    //The zstream structure is used to pass information to and from the zlib routines, and to maintain the inflate() state. readBuf and procBuf are the input and output buffers for inflate().
     z_stream zstream;
     int zerr;
     long compRemaining;
 
+    //ZipEntry的compLen表示这个文件在zip包中压缩后的大小
     compRemaining = pEntry->compLen;
 
     /*
      * Initialize the zlib stream.
      */
+    // The first thing we do is to initialize the zlib state for decompression using inflateInit(). This must be done before the first use of inflate(). The zalloc, zfree, and opaque fields in the zstream structure must be initialized before calling inflateInit(). Here they are set to the zlib constant Z_NULL to request that zlib use the default memory allocation routines
     memset(&zstream, 0, sizeof(zstream));
     zstream.zalloc = Z_NULL;
     zstream.zfree = Z_NULL;
     zstream.opaque = Z_NULL;
     zstream.next_in = pArchive->addr + pEntry->offset;
+    //avail_in and next_in must be initialized before calling inflateInit() This is because the application has the option to provide the start of the zlib stream in order for inflateInit() to have access to information about the compression method to aid in memory allocation. 
     zstream.avail_in = pEntry->compLen;
     zstream.next_out = (Bytef*) procBuf;
     zstream.avail_out = sizeof(procBuf);
@@ -549,8 +553,11 @@ static bool processDeflatedEntry(const ZipArchive *pArchive,
     /*
      * Loop while we have data.
      */
+    //The outer do-loop decompresses input until inflate() indicates that it has reached the end of the compressed data and has produced all of the uncompressed output. 
     do {
+        // decompress until deflate stream ends or end of file 
         /* uncompress the data */
+        //inflate中真正实现解压
         zerr = inflate(&zstream, Z_NO_FLUSH);
         if (zerr != Z_OK && zerr != Z_STREAM_END) {
             LOGD("zlib inflate call failed (zerr=%d)\n", zerr);
@@ -563,12 +570,14 @@ static bool processDeflatedEntry(const ZipArchive *pArchive,
         {
             long procSize = zstream.next_out - procBuf;
             LOGVV("+++ processing %d bytes\n", (int) procSize);
+            //调用receive_new_data,接受解压出来的数据,procBuf指向解压出来的数据地址, 数据长度为procSize
             bool ret = processFunction(procBuf, procSize, cookie);
             if (!ret) {
                 LOGW("Process function elected to fail (in inflate)\n");
                 goto z_bail;
             }
 
+            //the same output space is provided for each call of inflate().
             zstream.next_out = procBuf;
             zstream.avail_out = sizeof(procBuf);
         }
@@ -577,12 +586,14 @@ static bool processDeflatedEntry(const ZipArchive *pArchive,
     assert(zerr == Z_STREAM_END);       /* other errors should've been caught */
 
     // success!
+    // 在do while循环中将receive_new_data解压完后,保存一共解压数据的大小
     result = zstream.total_out;
 
 z_bail:
     inflateEnd(&zstream);        /* free up any allocated structures */
 
 bail:
+    // 一共解压数据的大小应该与uncompLen相等
     if (result != pEntry->uncompLen) {
         if (result != -1)        // error already shown?
             LOGW("Size mismatch on inflated file (%ld vs %ld)\n",
@@ -602,6 +613,9 @@ bail:
  *
  * This is useful for calculating the hash of an entry's uncompressed contents.
  */
+// updater\blockimg.c中的unzip_new_data调用mzProcessZipEntryContents传递参数为:
+// pArchive--nti->za -- ota zip包,pEntry--nti->entry-- ota zip包中代表system.new.da的entry
+// cookie -- nti, processFunction --函数receive_new_data
 bool mzProcessZipEntryContents(const ZipArchive *pArchive,
     const ZipEntry *pEntry, ProcessZipEntryContentsFunction processFunction,
     void *cookie)
@@ -610,9 +624,11 @@ bool mzProcessZipEntryContents(const ZipArchive *pArchive,
     off_t oldOff;
 
     switch (pEntry->compression) {
+    // 处理system.patch.dat时走这里,因为system.patch.dat在ota包中直接存储,没有压缩
     case STORED:
         ret = processStoredEntry(pArchive, pEntry, processFunction, cookie);
         break;
+    // unzip_new_data处理system.new.dat时走这里,因为system.new.dat在ota包中用deflate算法压缩
     case DEFLATED:
         ret = processDeflatedEntry(pArchive, pEntry, processFunction, cookie);
         break;

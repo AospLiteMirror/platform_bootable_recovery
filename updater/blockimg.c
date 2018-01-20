@@ -16,6 +16,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <pthread.h>
@@ -23,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/ioctl.h>
@@ -32,7 +34,8 @@
 #include "applypatch/applypatch.h"
 #include "edify/expr.h"
 #include "mincrypt/sha.h"
-#include "minzip/DirUtil.h"
+//Split individual transfer list commands into separate functions with unified parameters for clarity, and use a hash table to locate them during execution.
+#include "minzip/Hash.h"
 #include "updater.h"
 
 #define BLOCKSIZE 4096
@@ -45,6 +48,10 @@
 #ifndef BLKDISCARD
 #define BLKDISCARD _IO(0x12,119)
 #endif
+
+#define STASH_DIRECTORY_BASE "/cache/recovery"
+#define STASH_DIRECTORY_MODE 0700
+#define STASH_FILE_MODE 0600
 
 char* PrintSha1(const uint8_t* digest);
 
@@ -59,6 +66,7 @@ typedef struct {
 static RangeSet* parse_range(char* text) {
     char* save;
     int num;
+    //将text最前面的 block编号 个数30 给num
     num = strtol(strtok_r(text, ",", &save), NULL, 0);
 
     RangeSet* out = malloc(sizeof(RangeSet) + num * sizeof(int));
@@ -67,17 +75,22 @@ static RangeSet* parse_range(char* text) {
                 sizeof(RangeSet) + num * sizeof(int));
         exit(1);
     }
+    // 30个block编号,num=30,  两个block编号构成一个区间, 一共15个范围
     out->count = num / 2;
     out->size = 0;
     int i;
     for (i = 0; i < num; ++i) {
+         //30个out->pos[i] 就保存的是每个block编号
         out->pos[i] = strtol(strtok_r(NULL, ",", &save), NULL, 0);
         if (i%2) {
+             // i = 1, out->size = 0 - 32770 + 32825
             out->size += out->pos[i];
         } else {
+            //i=0时,out->size = 0 - 32770
             out->size -= out->pos[i];
         }
     }
+    //for循环执行完, out->size就= (32825 - 32770) + (33370 - 32827) + ..... 15个范围每个的右边减左边
 
     return out;
 }
@@ -142,6 +155,7 @@ static int write_all(int fd, const uint8_t* data, size_t size) {
     return 0;
 }
 
+// check_lseek函数用于设置写入的偏移量,定位写入位置
 // 成功返回0,失败返回-1
 static int check_lseek(int fd, off64_t offset, int whence) {
     while (true) {
@@ -179,6 +193,7 @@ typedef struct {
     size_t p_remain;
 } RangeSinkState;
 
+// 在RangeSinkWrite中实现将system.new.data解压后的数据写入target的功能
 // RangeSinkWrite 相对于函数FileSink和MemorySink,是将一个区间段数据写入闪存
 // 1 在BlockImageUpdateFn中执行transfer.list中的imgdiff或bsdiff命令时,调用ApplyImagePatch或ApplyBSDiffPatch时传入的sink函数指针
 // 2 receive_new_data中直接调用
@@ -192,6 +207,7 @@ static ssize_t RangeSinkWrite(const uint8_t* data, ssize_t size, void* token) {
     // RangeSinkState的p_remain代表剩余要从内存写入闪存的数据大小
     if (rss->p_remain <= 0) {
         fprintf(stderr, "range sink write overrun");
+        // 之前是exit(1); transfer list V3中检测到这种情况不推出,返回0
         return 0;
     }
 
@@ -200,9 +216,17 @@ static ssize_t RangeSinkWrite(const uint8_t* data, ssize_t size, void* token) {
     while (size > 0) {
         // write_now代表剩余要写入的大小
         size_t write_now = size;
-        if (rss->p_remain < write_now) write_now = rss->p_remain;
+
+        if (rss->p_remain < write_now) {
+            write_now = rss->p_remain;
+        }
+
         // 写入write_now大小的数据
-        writeblock(rss->fd, data, write_now);
+        if (write_all(rss->fd, data, write_now) == -1) {
+            break;
+        }
+        
+ 
         // 移动要写入的should地址
         data += write_now;
         size -= write_now;
@@ -218,14 +242,20 @@ static ssize_t RangeSinkWrite(const uint8_t* data, ssize_t size, void* token) {
             ++rss->p_block;
             // 如果p_block<总区段个数,就继续更新下一个block区间
             if (rss->p_block < rss->tgt->count) {
-                rss->p_remain = (rss->tgt->pos[rss->p_block*2+1] - rss->tgt->pos[rss->p_block*2]) * BLOCKSIZE;
+			    rss->p_remain = (rss->tgt->pos[rss->p_block * 2 + 1] -
+							  rss->tgt->pos[rss->p_block * 2]) * BLOCKSIZE;
+
                 // 调用check_lseek,将读写位置指向下一个block区间其实位置
-                check_lseek(rss->fd, (off64_t)rss->tgt->pos[rss->p_block*2] * BLOCKSIZE, SEEK_SET);
+ 			    if (check_lseek(rss->fd, (off64_t)rss->tgt->pos[rss->p_block*2] * BLOCKSIZE,
+ 					    SEEK_SET) == -1) {
+ 				    break;
+ 			    }
+
             } else {
                 // 说明已经更新完所有block区间, 返回已经写入的数据的大小
                 // we can't write any more; return how many bytes have
                 // been written so far.
-                return written;
+                break;
             }
         }
     }
@@ -264,21 +294,34 @@ typedef struct {
     pthread_cond_t cv;
 } NewThreadInfo;
 
+// 相关调用顺序为:BlockImageUpdateFn--unzip_new_data--mzProcessZipEntryContents--processDeflatedEntry或processStoredEntry--receive_new_data
 static bool receive_new_data(const unsigned char* data, int size, void* cookie) {
     NewThreadInfo* nti = (NewThreadInfo*) cookie;
 
     while (size > 0) {
         // Wait for nti->rss to be non-NULL, indicating some of this
         // data is wanted.
+        // nti->rss在BlockImageUpdateFn开始为NULL,
+        //            pthread_mutex_lock(&nti.mu);
+        //            nti.rss = &rss;		               在解析system.transfer.list循环中如果遇见new命令,主线程就会在互斥锁中给nti->rss赋值
+        //            pthread_cond_broadcast(&nti.cv);
+        //            while (nti.rss) {  //在receive_new_data函数中在所有解压system.new.data的数据都写入完后将nti->rss=NULL, 在这之前主线程BlockImageUpdateFn一直阻塞
+        //                pthread_cond_wait(&nti.cv, &nti.mu); 
+        //            }
+        //            pthread_mutex_unlock(&nti.mu);
+        // nti的mu,cv都是线程相关的信号量, pthread_mutex_t mu;  pthread_cond_t cv; 
         pthread_mutex_lock(&nti->mu);
+        //receive_new_data所在的后台线程执行到这里就一直等待主线程执行nti.rss = &rss;
         while (nti->rss == NULL) {
             pthread_cond_wait(&nti->cv, &nti->mu);
         }
         pthread_mutex_unlock(&nti->mu);
 
+        //while跳出后说明主线程执行了nti.rss = &rss;  其中RangeSinkState rss;  rss.fd = fd;  rss.tgt = tgt;   rss.p_block = 0;  rss.p_remain = (tgt->pos[1] - tgt->pos[0]) * BLOCKSIZE;
         // At this point nti->rss is set, and we own it.  The main
         // thread is waiting for it to disappear from nti.
         ssize_t written = RangeSinkWrite(data, size, nti->rss);
+        //RangeSinkWrite返回写入数据多少,因此写入地址data要加上返回值written,要写入多少size要减返回值
         data += written;
         size -= written;
 
@@ -286,6 +329,7 @@ static bool receive_new_data(const unsigned char* data, int size, void* cookie) 
             // we have written all the bytes desired by this rss.
 
             pthread_mutex_lock(&nti->mu);
+            //解压system.new.data的数据都写入完后将nti->rss=NULL
             nti->rss = NULL;
             pthread_cond_broadcast(&nti->cv);
             pthread_mutex_unlock(&nti->mu);
@@ -295,8 +339,17 @@ static bool receive_new_data(const unsigned char* data, int size, void* cookie) 
     return true;
 }
 
+// 在BlockImageUpdateFn中创建了一个线程new_data_thread,执行函数unzip_new_data, 来完成对system.new.dat文件的处理:pthread_create(&new_data_thread, &attr, unzip_new_data, &nti);
+// 传给unzip_new_data的参数nti取值为:
+// NewThreadInfo nti;
+// nti.za = za;  // za代表ota zip包, ZipArchive* za = ((UpdaterInfo*)(state->cookie))->package_zip;
+// nti.entry = new_entry; // 这里就将ota zip包中的system.new.dat传给了nti.entry, const ZipEntry* new_entry = mzFindZipEntry(za, new_data_fn->data);
+// nti.rss = NULL;  // 先将rss标记置空
+// pthread_mutex_init(&nti.mu, NULL); // 互斥锁的初始化
+// pthread_cond_init(&nti.cv, NULL); // 创建一个条件变量，cv就是condition value的意思
 static void* unzip_new_data(void* cookie) {
     NewThreadInfo* nti = (NewThreadInfo*) cookie;
+    // unzip_new_data函数主要调用mzProcessZipEntryContents完成对system.new.data文件的解压
     mzProcessZipEntryContents(nti->za, nti->entry, receive_new_data, nti);
     return NULL;
 }
@@ -344,8 +397,9 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
         goto done;
     }
 
-	//这里的ui是updater info的含义，而不是user interface
+	// 这里的ui是updater info的含义，而不是user interface
     UpdaterInfo* ui = (UpdaterInfo*)(state->cookie);
+    // 升级时updater子进程通过cmd_pipe将progress进度传给recovery进程
     FILE* cmd_pipe = ui->cmd_pipe;
 
 	// za这时就代表zip格式的整个ota包
@@ -424,8 +478,9 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
 // rss and signals the condition again.
     pthread_t new_data_thread;
     NewThreadInfo nti;
+    // nti.za就代表整个zip格式的ota包
     nti.za = za;
-	 // 这里就将ota zip包中的system.new.dat传给了nti.entry
+	// 这里就将ota zip包中的system.new.dat传给了nti.entry
     nti.entry = new_entry;
 	//先将rss标记置空
     nti.rss = NULL;
@@ -453,25 +508,28 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
     char* linesave;
     char* wordsave;
 
+    // 代开文件/dev/block/bootdevice/by-name/system
     int fd = open(blockdev_filename->data, O_RDWR);
     if (fd < 0) {
         ErrorAbort(state, "failed to open %s: %s", blockdev_filename->data, strerror(errno));
         goto done;
     }
 
+    // line用于保存transfer.list文件的每一单行
     char* line;
     char* word;
 
     // The data in transfer_list_value is not necessarily
     // null-terminated, so we need to copy it to a new buffer and add
     // the null that strtok_r will need.
+    // 分配一段内存,在之后用于保存transfer.list文件所有内容,transfer_list指向分配的这段内存
     transfer_list = malloc(transfer_list_value->size+1);
     if (transfer_list == NULL) {
         fprintf(stderr, "failed to allocate %zd bytes for transfer list\n",
                 transfer_list_value->size+1);
         exit(1);
     }
-	//将system.transfer.list文件的所有内容读取到了transfer_list中
+	//将system.transfer.list文件的所有内容读取到了transfer_list指向的内存中
     memcpy(transfer_list, transfer_list_value->data, transfer_list_value->size);
 	//按行分割读取system.transfer.list中的命令
     transfer_list[transfer_list_value->size] = '\0';
@@ -480,7 +538,9 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
 
     // first line in transfer list is the version number; currently
     // there's only version 1.
-	// recovery 5.0对应的api是1
+	// recovery 5.0 lollipop-erlease对应的api是1
+	// d83e4f15890ac6ebe0d61924bd224eb1ae8565ad support for version 2 of block image diffs Change-Id: I4559bfd76d5403859637aeac832f3a5e9e13b63a 开始新增V2
+	// 90221205a3e58f2a198faa838088dc7bc7c9c752 Support resuming block based OTAs Change-Id: I1e752464134aeb2d396946348e6041acabe13942 开始新增V3
     if (strcmp(line, "1") != 0) {
         ErrorAbort(state, "unexpected transfer list version [%s]\n", line);
         goto done;
@@ -501,7 +561,7 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
 	// 在这个for循环中依次读取每行命令
     for (line = strtok_r(NULL, "\n", &linesave); line;
          line = strtok_r(NULL, "\n", &linesave)) {
-		// style代表每行前的命令名称，如move，bsdiff等
+		// style代表每行前的命令名称，如move，bsdiff等	
         char* style;
         style = strtok_r(line, " ", &wordsave);
 
@@ -740,10 +800,14 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
     return StringValue(success ? strdup("t") : strdup(""));
 }
 
+//if (range_sha1("/dev/block/platform/mtk-msdc.0/11230000.msdc0/by-name/syst
+//em", "72,1,32770,32929,32931,33439,65535,65536,65538,66046,98303,98304,98306,98465,98467,98975,131071,131072,131074,131582,163839,163840,163842,164001,164003,164511,196607,196608,196610,197118,22
+//9375,229376,229378,229537,229539,230047,262143,262144,262146,262654,294911,294912,294914,295073,295075,295583,327679,327680,327682,328190,355086,360448,360450,393216,393218,425984,425986,458752,458754,491520,491522,524288,524290,557056,557058,589824,589826,622592,622594,623102,650190,650191,655320") == "3168346b9a857c0dd0e962e86032bf464a007957" || block_image_verify("/dev/block/platform/mtk-msdc.0/11230000.msdc0/by-name/system", package_extract_file("system.transfer.list"), "system.new.dat", "system.patch.dat")) then
 Value* RangeSha1Fn(const char* name, State* state, int argc, Expr* argv[]) {
     Value* blockdev_filename;
     Value* ranges;
     const uint8_t* digest = NULL;
+    // 解析range_sha1的分区路径到blockdev_filename,解析区间范围参数到ranges
     if (ReadValueArgs(state, argv, 2, &blockdev_filename, &ranges) < 0) {
         return NULL;
     }
@@ -757,26 +821,33 @@ Value* RangeSha1Fn(const char* name, State* state, int argc, Expr* argv[]) {
         goto done;
     }
 
+    // 打开/dev/block/platform/mtk-msdc.0/11230000.msdc0/by-name/system设备节点
     int fd = open(blockdev_filename->data, O_RDWR);
     if (fd < 0) {
         ErrorAbort(state, "failed to open %s: %s", blockdev_filename->data, strerror(errno));
         goto done;
     }
 
+    // ranges->data指向"72,1,32770,32...",将这72个区间段解析后保存到rs
     RangeSet* rs = parse_range(ranges->data);
+    // buffer大小刚好是1个block
     uint8_t buffer[BLOCKSIZE];
 
     SHA_CTX ctx;
     SHA_init(&ctx);
 
     int i, j;
+    // 在for循环中累计更新这72个区间的hash,累计完后一次性计算sha1
     for (i = 0; i < rs->count; ++i) {
         check_lseek(fd, (off64_t)rs->pos[i*2] * BLOCKSIZE, SEEK_SET);
+        // 这个for中更新每个区间内所有block的hash
         for (j = rs->pos[i*2]; j < rs->pos[i*2+1]; ++j) {
+            //每循环一次读取1个block,并更新hash
             readblock(fd, buffer, BLOCKSIZE);
             SHA_update(&ctx, buffer, BLOCKSIZE);
         }
     }
+    // digest就是最终这72个区间的sha1,range_sha1返回digest的值,在if中和3168346b9a857c0dd0e962e86032bf464a007957比较
     digest = SHA_final(&ctx);
     close(fd);
 
@@ -784,8 +855,10 @@ Value* RangeSha1Fn(const char* name, State* state, int argc, Expr* argv[]) {
     FreeValue(blockdev_filename);
     FreeValue(ranges);
     if (digest == NULL) {
+        // 如果digest为空,则range_sha1就返回""
         return StringValue(strdup(""));
     } else {
+        // 正常情况
         return StringValue(PrintSha1(digest));
     }
 }
