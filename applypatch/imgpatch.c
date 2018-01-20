@@ -30,6 +30,14 @@
 #include "imgdiff.h"
 #include "utils.h"
 
+// 在GenerateTarget中调用ApplyImagePatch:
+// if (header_bytes_read >= 8 && memcmp(header, "IMGDIFF2", 8) == 0) {
+//         result = ApplyImagePatch(source_to_use->data, source_to_use->size, patch, sink, token, &ctx, bonus_data);
+// 其中source_to_use->data -- 指向source的实际数据, 
+// source_to_use->size -- source实际数据的大小
+// patch -- 代表patch的数据机构object
+// sink -- ApplyBSDiffPatch中在内存中生成了target的数据, 然后调用sink按对文件还是分区打patch的不同方式保存这些数据
+// token -- 最终输出生成target数据的地址
 /*
  * Apply the patch given in 'patch_filename' to the source data given
  * by (old_data, old_size).  Write the patched output to the 'output'
@@ -40,8 +48,10 @@ int ApplyImagePatch(const unsigned char* old_data, ssize_t old_size __unused,
                     const Value* patch,
                     SinkFn sink, void* token, SHA_CTX* ctx,
                     const Value* bonus_data) {
+	//imgdiff生成的patch,头8字节后还有4字节chunk count
     ssize_t pos = 12;
     char* header = patch->data;
+	//imgdiff生成的patch,头8字节后还有4字节chunk count
     if (patch->size < 12) {
         printf("patch too short to contain header\n");
         return -1;
@@ -55,6 +65,7 @@ int ApplyImagePatch(const unsigned char* old_data, ssize_t old_size __unused,
         return -1;
     }
 
+	//从patch的head编译8字节,读取之后的4个字节
     int num_chunks = Read4(header+8);
 
     int i;

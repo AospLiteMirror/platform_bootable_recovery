@@ -38,6 +38,7 @@ typedef struct _FileContents {
 // it to free up space.  If the expected source file doesn't exist, or
 // is corrupted, we look to see if this file contains the bits we want
 // and use it as the source instead.
+// target filesystem 中如果没有足够空间来对待打patch的文件打patch, 就把这个原始文件拷贝到cache/saved.file
 #define CACHE_TEMP_SOURCE "/cache/saved.file"
 
 typedef ssize_t (*SinkFn)(const unsigned char*, ssize_t, void*);

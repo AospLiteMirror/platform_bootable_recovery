@@ -111,26 +111,35 @@ try_update_binary(const char *path, ZipArchive *zip, int* wipe_cache) {
 
     const char** args = (const char**)malloc(sizeof(char*) * 5);
     args[0] = binary;
+	// 调用updater的3个参数：1 recovery API： the version number for this interface
     args[1] = EXPAND(RECOVERY_API_VERSION);   // defined in Android.mk
     char* temp = (char*)malloc(10);
+	// 2  一个管道的fd，updater向这个管道写，用于更新进度条 an fd to which the program can write in order to update the progress bar
+	//把pipefd[1]代表的管道的fd，作为字符串参数传给updater
     sprintf(temp, "%d", pipefd[1]);
     args[2] = temp;
+	//3 升级包路径 the name of the package zip file  
     args[3] = (char*)path;
     args[4] = NULL;
 
     pid_t pid = fork();
     if (pid == 0) {
         umask(022);
+		 //updater中关闭pipefd[0]
         close(pipefd[0]);
+		// 如果应用程序正常执行完毕，那么execv是永远不会返回的；当execv在调用进程中返回时，那么这个应用程序应该出错了
         execv(binary, (char* const*)args);
+		//updater执行正确永远不会被调用
         fprintf(stdout, "E:Can't run %s (%s)\n", binary, strerror(errno));
         _exit(-1);
     }
+	 //recovery中关闭pipefd[1]
     close(pipefd[1]);
 
     *wipe_cache = 0;
 
     char buffer[1024];
+	 //recovery从管道接收来自updater的信息
     FILE* from_child = fdopen(pipefd[0], "r");
     while (fgets(buffer, sizeof(buffer), from_child) != NULL) {
         char* command = strtok(buffer, " \n");

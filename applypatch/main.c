@@ -115,12 +115,14 @@ int PatchMode(int argc, char** argv) {
         argv += 2;
     }
 
+	//输入参数至少6个
     if (argc < 6) {
         return 2;
     }
 
     char* endptr;
     size_t target_size = strtol(argv[4], &endptr, 10);
+	//调用PatchMode传入的代表targetfile的大小的argv[4]字符串解析出来的数值无效
     if (target_size == 0 && endptr == argv[4]) {
         printf("can't parse \"%s\" as byte count\n\n", argv[4]);
         return 1;
@@ -129,11 +131,14 @@ int PatchMode(int argc, char** argv) {
     char** sha1s;
     Value** patches;
     int num_patches;
+	//从argv[5]及其以后都是 sha:文件路径 或 sha 的一串数组，调用ParsePatchArgs将这串数组个数保存到num_patches中，
+    //将其中所有的sha保存到sha1s指向的数组中， argv[5]及其以后的所有patch文件内容保存在patches[i].data指向的数组中
     if (ParsePatchArgs(argc-5, argv+5, &sha1s, &patches, &num_patches) != 0) {
         printf("failed to parse patch args\n");
         return 1;
     }
 
+	// 调用applypatch的参数: argv[1]--oldfile, argv[2]--newfile argv[3]--newfilesha1 
     int result = applypatch(argv[1], argv[2], argv[3], target_size,
                             num_patches, sha1s, patches, bonus);
 
@@ -178,6 +183,32 @@ int PatchMode(int argc, char** argv) {
 // to read the source data.  See the comments for the
 // LoadMTDContents() function above for the format of such a filename.
 
+/*applypatch下的Android.mk中会生成
+1 libapplypatch 这个是真正供updater升级时调用的
+2 applypatch applypatch_static 这两个是完整的可执行文件,主要是用来供recovery\applypatch下的测试脚本applypatch.sh调用
+3 imgdiff
+
+applypatch.sh  测试applypatch下的Android.mk中编出来的applypatch
+脚本先将applypatch push到手机的/system下,脚本中的run_command函数是adb shell命令的封装
+一 # --------------- check mode ----------------------
+run_command $WORK_DIR/applypatch -c $WORK_DIR/old.file $OLD_SHA1 || fail
+applypatch -c参数
+applypatch -c old.file sha1(sha1 是 old.file这个文件的sha1) [sha2  ...]
+-c后可以跟多个sha1值,其中有一个是old.file的sha1
+
+applypatch中还有
+testname "check mode cache (corrupted) single"
+run_command $WORK_DIR/applypatch -c $WORK_DIR/old.file $OLD_SHA1 || fail
+testname "check mode cache (missing) single"
+run_command $WORK_DIR/applypatch -c $WORK_DIR/old.file $OLD_SHA1 || fail
+说明applypatch_check要检查的文件如果确实或者损坏，都会去检查cache下的拷贝的sha1是否匹配
+二 # --------------- apply patch ----------------------
+run_command $WORK_DIR/applypatch $WORK_DIR/old.file - $NEW_SHA1 $NEW_SIZE $BAD1_SHA1:$WORK_DIR/foo $OLD_SHA1:$WORK_DIR/patch.bsdiff
+相当于手机中运行applypatch(argv[0])  /system/old.file(argv[1]) -(argv[2])  newfilesha1(argv[3])  newfilesize(argv[4])  bad_sha1:/system/foo(这个文件内容是“hello”)(argv[5])  oldfilesha1:/system/patch.bsdiff(argv[6]) 
+其中-(argv[2]) 通常是由targetfile的路径代替
+这将在applypatch的main.c中调用：PatchMode(argc, argv);
+*/
+
 int main(int argc, char** argv) {
     if (argc < 2) {
       usage:
@@ -200,6 +231,8 @@ int main(int argc, char** argv) {
     if (strncmp(argv[1], "-l", 3) == 0) {
         result = ShowLicenses();
     } else if (strncmp(argv[1], "-c", 3) == 0) {
+		//因此-c参数执行CheckMode --- applypatch_check(argv[2], argc-3, argv+3);
+		//argv[2]这时相当于old.file   argc-3,--要检测的sha值个数, argv+3 指向第一个要检测的sha1
         result = CheckMode(argc, argv);
     } else if (strncmp(argv[1], "-s", 3) == 0) {
         result = SpaceMode(argc, argv);

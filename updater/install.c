@@ -503,6 +503,10 @@ Value* PackageExtractDirFn(const char* name, State* state,
 }
 
 
+// 用法:
+// package_extract_file("system.transfer.list")
+// package_extract_file("patch/boot.img.p")
+// package_extract_file("META-INF/com/miui/miui_update", "/cache/miui_update");
 // package_extract_file(package_path, destination_path)
 //   or
 // package_extract_file(package_path)
@@ -510,12 +514,22 @@ Value* PackageExtractDirFn(const char* name, State* state,
 //   function (the char* returned is actually a FileContents*).
 Value* PackageExtractFileFn(const char* name, State* state,
                            int argc, Expr* argv[]) {
+	// argc就代表脚本中package_extract_file函数的参数个数
     if (argc < 1 || argc > 2) {
         return ErrorAbort(state, "%s() expects 1 or 2 args, got %d",
                           name, argc);
     }
     bool success = false;
 
+	// 在updater开始将updater_info保存到了state->cookie中
+	   UpdaterInfo updater_info;
+    updater_info.cmd_pipe = cmd_pipe;
+    //updater_info.package_zip = &za;
+    //updater_info.version = atoi(version);
+    //updater_info.package_zip_addr = map.addr;
+    //updater_info.package_zip_len = map.length;
+    //State state;
+    //state.cookie = &updater_info;
     UpdaterInfo* ui = (UpdaterInfo*)(state->cookie);
 
     if (argc == 2) {
@@ -556,9 +570,11 @@ Value* PackageExtractFileFn(const char* name, State* state,
         v->size = -1;
         v->data = NULL;
 
+		// 调用ReadArgs从 package_extract_file("system.transfer.list")中取出system.transfer.list作为zip_path
         if (ReadArgs(state, argv, 1, &zip_path) < 0) return NULL;
 
         ZipArchive* za = ((UpdaterInfo*)(state->cookie))->package_zip;
+		//从映射到内存中的zip压缩包中找到zip_path
         const ZipEntry* entry = mzFindZipEntry(za, zip_path);
         if (entry == NULL) {
             printf("%s: no %s in package\n", name, zip_path);
@@ -573,6 +589,9 @@ Value* PackageExtractFileFn(const char* name, State* state,
             goto done1;
         }
 
+		//将zip_path（system.transfer.list）的内容从zip包中解压缩到v->data中
+		//mzExtractZipEntryToBuffer:* Uncompress "pEntry" in "pArchive" to buffer, which must be large
+        //* enough to hold mzGetZipEntryUncomplen(pEntry) bytes.
         success = mzExtractZipEntryToBuffer(za, entry,
                                             (unsigned char *)v->data);
 
@@ -580,6 +599,7 @@ Value* PackageExtractFileFn(const char* name, State* state,
         free(zip_path);
         if (!success) {
             free(v->data);
+			//如果mzExtractZipEntryToBuffer执行失败就将v->data重新设为空
             v->data = NULL;
             v->size = -1;
         }

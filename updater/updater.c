@@ -42,6 +42,8 @@ int main(int argc, char** argv) {
     // log file makes more sense if buffering is turned off so things
     // appear in the right order.
     setbuf(stdout, NULL);
+	// 创建子进程时，父进程的缓冲区也被复制到子进程了。所以子进程在printf时，就一起printf出来了，因为recovery中已经将 stdout stderr重定向到了文件中，所以这里把输出缓冲区设置为无缓冲，直接从流输出数据
+    //setbuf函数的第二个参数取值可以为null，此时标准输出不需要进行缓冲。这种情况下，程序仍然能够工作，只不过速度较慢而已 
     setbuf(stderr, NULL);
 
     if (argc != 4) {
@@ -61,20 +63,24 @@ int main(int argc, char** argv) {
 
     // Set up the pipe for sending commands back to the parent process.
 
+	// 将recovery传递的字符串格式的pipe[1]的fd，转换为fd，再打开这个管道
     int fd = atoi(argv[2]);
     FILE* cmd_pipe = fdopen(fd, "wb");
     setlinebuf(cmd_pipe);
 
     // Extract the script from the package.
 
+	//argv[3]就是升级包完成路径
     const char* package_filename = argv[3];
     MemMapping map;
+	//将升级包映射到内存中
     if (sysMapFile(package_filename, &map) != 0) {
         printf("failed to map package %s\n", argv[3]);
         return 3;
     }
     ZipArchive za;
     int err;
+	//根据内存中的起始地址和长度，打开这个文件
     err = mzOpenZipArchive(map.addr, map.length, &za);
     if (err != 0) {
         printf("failed to open package %s: %s\n",
@@ -82,6 +88,7 @@ int main(int argc, char** argv) {
         return 3;
     }
 
+	//在文件中查找升级脚本这个entry
     const ZipEntry* script_entry = mzFindZipEntry(&za, SCRIPT_NAME);
     if (script_entry == NULL) {
         printf("failed to find %s in %s\n", SCRIPT_NAME, package_filename);
@@ -89,6 +96,7 @@ int main(int argc, char** argv) {
     }
 
     char* script = malloc(script_entry->uncompLen+1);
+	// 根据升级脚本的实际大小分配一段内存，将升级脚本所有内容读到script中
     if (!mzReadZipEntry(&za, script_entry, script, script_entry->uncompLen)) {
         printf("failed to read script from package\n");
         return 5;
@@ -107,6 +115,7 @@ int main(int argc, char** argv) {
 
     Expr* root;
     int error_count = 0;
+	//解析脚本
     int error = parse_string(script, &root, &error_count);
     if (error != 0 || error_count > 0) {
         printf("%d parse errors\n", error_count);
@@ -126,17 +135,26 @@ int main(int argc, char** argv) {
     // Evaluate the parsed script.
 
     UpdaterInfo updater_info;
+	//updater_info.cmd_pipe取得了updater打开的管道
     updater_info.cmd_pipe = cmd_pipe;
+	//updater_info.package_zip 内存中的zip升级包
     updater_info.package_zip = &za;
+	//updater_info.version  recovery api版本
     updater_info.version = atoi(version);
+	//updater_info.package_zip_addr zip升级包在内存中的起始地址
     updater_info.package_zip_addr = map.addr;
+	// updater_info.package_zip_len zip升级包在内存中的长度
     updater_info.package_zip_len = map.length;
 
     State state;
     state.cookie = &updater_info;
+	//现在state.script指向的就是脚本内容
     state.script = script;
     state.errmsg = NULL;
 
+	//执行脚本 
+	//char* Evaluate(State* state, Expr* expr)  Evaluate()函数主要是调用了expr的fn()函数，参数expr的类型是Expr
+	//从Expr的定义中可以看到它有一个字段argv，这个字段是Expr指针的指针类型，它实际上会指向一个Expr指针的数组对象，表示Expr对象的所有下一级对象。通过这个字段，脚本解析后得到的所有命令都串接在一起，而且命令的执行函数还会调用Ecaluate()来继续执行argv中的Expr对象，因此，虽然Evaluate()中只调用了root对象的fn()函数，但是实际上会执行脚本中的所有命令。
     char* result = Evaluate(&state, root);
     if (result == NULL) {
         if (state.errmsg == NULL) {

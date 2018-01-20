@@ -34,6 +34,7 @@ int BooleanString(const char* s) {
 
 char* Evaluate(State* state, Expr* expr) {
     Value* v = expr->fn(expr->name, state, expr->argc, expr->argv);
+	//typedef Value* (*Function)(const char* name, State* state, int argc, Expr* argv[]);
     if (v == NULL) return NULL;
     if (v->type != VAL_STRING) {
         ErrorAbort(state, "expecting string, got value type %d", v->type);

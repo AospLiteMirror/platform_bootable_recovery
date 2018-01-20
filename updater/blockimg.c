@@ -245,6 +245,7 @@ static void* unzip_new_data(void* cookie) {
     return NULL;
 }
 
+//block_image_update("/dev/block/bootdevice/by-name/system", package_extract_file("system.transfer.list"), "system.new.dat", "system.patch.dat");
 // args:
 //    - block device (or file) to modify in-place
 //    - transfer list (blob)
@@ -259,15 +260,21 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
     Value* patch_data_fn;
     bool success = false;
 
+	//ReadValueArgs取得脚本中的/dev/block/bootdevice/by-name/system，package_extract_file("system.transfer.list"),system.new.dat", "system.patch.dat"这四个参数，赋值给blockdev_filename ，transfer_list_value， new_data_fn，patch_data_fn
+	// 因为block_image_update中有类似package_extract_file("system.transfer.list")这种还需要执行才能得到返回值的函数
+	// 在ReadValueArgs中利用va_list等C语言的可变参数宏，将block_image_update的四个输入参数"/dev/block/bootdevice/by-name/system", package_extract_file("system.transfer.list"), "system.new.dat", "system.patch.dat"，分别赋值给blockdev_filename，transfer_list_value，new_data_fn，patch_data_fn
     if (ReadValueArgs(state, argv, 4, &blockdev_filename, &transfer_list_value,
                       &new_data_fn, &patch_data_fn) < 0) {
         return NULL;
     }
 
     if (blockdev_filename->type != VAL_STRING) {
+	//在BlockImageUpdateFn函数中name就是block_image_update,这个错误log的意思就是block_image_update的blockdev_filename参数必须是string类型
         ErrorAbort(state, "blockdev_filename argument to %s must be string", name);
         goto done;
     }
+	//在package_extract_file("system.transfer.list"),中将type设为了VAL_BLOB
+	//BLOB (binary large object)，二进制大对象，是一个可以存储二进制文件的容器 //BLOB是一个大文件，典型的BLOB是一张图片或一个声音文件，由于它们的尺寸，必须使用特殊的方式来处理（例如：上传、下载或者存放到一个数据库）
     if (transfer_list_value->type != VAL_BLOB) {
         ErrorAbort(state, "transfer_list argument to %s must be blob", name);
         goto done;
@@ -281,20 +288,28 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
         goto done;
     }
 
+	//这里的ui是updater info的含义，而不是user interface
     UpdaterInfo* ui = (UpdaterInfo*)(state->cookie);
     FILE* cmd_pipe = ui->cmd_pipe;
 
+	// za这时就代表zip格式的整个ota包
     ZipArchive* za = ((UpdaterInfo*)(state->cookie))->package_zip;
 
+	//patch_data_fn->data指向的是“system.patch.dat”这段字符串，而不是 system.patch.dat这个文件的内容，
+    //因此patch_entry就代表内存中的zip安装包中的system.patch.dat这一项
     const ZipEntry* patch_entry = mzFindZipEntry(za, patch_data_fn->data);
     if (patch_entry == NULL) {
         ErrorAbort(state, "%s(): no file \"%s\" in package", name, patch_data_fn->data);
         goto done;
     }
 
+	//计算出patch_entry的起始地址，因为注释中说patch stream must be uncompressed
+	//patch_start在下面循环中执行bsdiff或imgdiff命令中会用到
     uint8_t* patch_start = ((UpdaterInfo*)(state->cookie))->package_zip_addr +
         mzGetZipEntryOffset(patch_entry);
 
+	//new_data_fn->data指向的数据是“system.new.dat”，而不是system.new.dat这个文件的内容
+	//new_entry就代表内存中的zip安装包中的system.new.dat这一项
     const ZipEntry* new_entry = mzFindZipEntry(za, new_data_fn->data);
     if (new_entry == NULL) {
         ErrorAbort(state, "%s(): no file \"%s\" in package", name, new_data_fn->data);
@@ -338,17 +353,43 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
     // already compressed, we lose very little by not compressing
     // their concatenation.)
 
+// we expand the new data from the archive in a
+// background thread, and block that threads 'receive uncompressed
+// data' function until the main thread has reached a point where we
+// want some new data to be written.  We signal the background thread
+// with the destination for the data and block the main thread,
+// waiting for the background thread to complete writing that section.
+// Then it signals the main thread to wake up and goes back to
+// blocking waiting for a transfer.
+// NewThreadInfo is the struct used to pass information back and forth
+// between the two threads.  When the main thread wants some data
+// written, it sets rss to the destination location and signals the
+// condition.  When the background thread is done writing, it clears
+// rss and signals the condition again.
     pthread_t new_data_thread;
     NewThreadInfo nti;
     nti.za = za;
+	 // 这里就将ota zip包中的system.new.dat传给了nti.entry
     nti.entry = new_entry;
+	//先将rss标记置空
     nti.rss = NULL;
+	//互斥锁的初始化
     pthread_mutex_init(&nti.mu, NULL);
+	//创建一个条件变量，cv就是condition value的意思
+	 //extern int pthread_cond_init __P ((pthread_cond_t *__cond,__const pthread_condattr_t *__cond_attr)); 其中cond是一个指向结构pthread_cond_t的指针，cond_attr是一个指向结构pthread_condattr_t的指 针。结构 pthread_condattr_t是条件变量的属性结构，和互斥锁一样我 们可以用它来设置条件变量是进程内可用还是进程间可用，默认值是 PTHREAD_ PROCESS_PRIVATE，即此条件变量被同一进程内的各个线程使用
     pthread_cond_init(&nti.cv, NULL);
 
+	//线程具有属性,用pthread_attr_t表示,在对该结构进行处理之前必须进行初始化，我们用pthread_attr_init函数对其初始化，用pthread_attr_destroy对其去除初始化
     pthread_attr_t attr;
     pthread_attr_init(&attr);
+	//pthread_attr_setdetachstate 修改线程的分离状态属性，可以使用pthread_attr_setdetachstate函数把线程属性detachstate设置为下面的两个合法值之一：设置为PTHREAD_CREATE_DETACHED,以分离状态启动线程；或者设置为PTHREAD_CREATE_JOINABLE,正常启动线程。线程的分离状态决定一个线程以什么样的方式来终止自己。在默认情况下线程是非分离状态的，这种情况下，原有的线程等待创建的线程结束。只有当pthread_join（）函数返回时，创建的线程才算终止，才能释放自己占用的系统资源。
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+	//pthread_create的四个参数：1指向线程标识符的指针 2 设置线程属性 3 线程运行函数的起始地址 4 运行函数的参数。
+	// pthread_create将会创建线程,在线程创建以后，就开始运行相关的线程函数
+	// 因此在BlockImageUpdateFn中将会创建出一个线程,
+    //线程标识符--new_data_thread,   //线程属性attr设置为了PTHREAD_CREATE_JOINABLE,代表非分离线程,非分离的线程终止时，其线程ID和退出状态将保留，直到另外一个线程调用pthread_join.
+    // 线程函数的起始地址, 这里就是执行unzip_new_data函数
+    //nti--传给unzip_new_data函数的参数 
     pthread_create(&new_data_thread, &attr, unzip_new_data, &nti);
 
     int i, j;
@@ -374,13 +415,16 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
                 transfer_list_value->size+1);
         exit(1);
     }
+	//将system.transfer.list文件的所有内容读取到了transfer_list中
     memcpy(transfer_list, transfer_list_value->data, transfer_list_value->size);
+	//按行分割读取system.transfer.list中的命令
     transfer_list[transfer_list_value->size] = '\0';
 
     line = strtok_r(transfer_list, "\n", &linesave);
 
     // first line in transfer list is the version number; currently
     // there's only version 1.
+	// recovery 5.0对应的api是1
     if (strcmp(line, "1") != 0) {
         ErrorAbort(state, "unexpected transfer list version [%s]\n", line);
         goto done;
@@ -398,24 +442,34 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
     size_t buffer_alloc = 0;
 
     // third and subsequent lines are all individual transfer commands.
+	// 在这个for循环中依次读取每行命令
     for (line = strtok_r(NULL, "\n", &linesave); line;
          line = strtok_r(NULL, "\n", &linesave)) {
+		// style代表每行前的命令名称，如move，bsdiff等
         char* style;
         style = strtok_r(line, " ", &wordsave);
 
+		// move b569d4f018e1cdda840f427eddc08a57b93d8c2e(sha1加密值,长度为40位) 2,545836,545840 4 2,545500,545504
+        // sha256--64 sha512--128
+        // move 2,545836,545840 2,545500,545504
+		//处理system.transfer.list中的move命令
         if (strcmp("move", style) == 0) {
             word = strtok_r(NULL, " ", &wordsave);
+			//将2,545836,545840 解析为src的range
             RangeSet* src = parse_range(word);
             word = strtok_r(NULL, " ", &wordsave);
+			//将2,545500,545504 解析为tgt的range
             RangeSet* tgt = parse_range(word);
 
             printf("  moving %d blocks\n", src->size);
 
+			//按src range大小申请buffer, 申请成功块个数记为buffer_alloc,正常情况下*buffer_alloc = size
             allocate(src->size * BLOCKSIZE, &buffer, &buffer_alloc);
             size_t p = 0;
             for (i = 0; i < src->count; ++i) {
                 check_lseek(fd, (off64_t)src->pos[i*2] * BLOCKSIZE, SEEK_SET);
                 size_t sz = (src->pos[i*2+1] - src->pos[i*2]) * BLOCKSIZE;
+				//从blockdev_filename->data中取偏移,将读到的内容保存到上面申请的buffer
                 readblock(fd, buffer+p, sz);
                 p += sz;
             }
@@ -424,11 +478,14 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
             for (i = 0; i < tgt->count; ++i) {
                 check_lseek(fd, (off64_t)tgt->pos[i*2] * BLOCKSIZE, SEEK_SET);
                 size_t sz = (tgt->pos[i*2+1] - tgt->pos[i*2]) * BLOCKSIZE;
+				//从blockdev_filename->data中取偏移,将buffer中的内容写入blockdev_filename->data
                 writeblock(fd, buffer+p, sz);
                 p += sz;
             }
 
+			//blocks_so_far在 for (line = strtok_r(NULL, "\n", &linesave)开始前初始化为0
             blocks_so_far += tgt->size;
+			//total_blocks是从transfer.list第二行读取的值,代表总共要写入的block数目
             fprintf(cmd_pipe, "set_progress %.4f\n", (double)blocks_so_far / total_blocks);
             fflush(cmd_pipe);
 
@@ -436,22 +493,33 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
             free(tgt);
 
         } else if (strcmp("zero", style) == 0 ||
+		//处理zero, 如果定义了DEBUG_ERASE为1, 这时erase mean fill the region with zeroes, 和zero的行为实际一样
+		//zero //30,32770,32825,32827,33307,65535,65536,65538,66018,98303,98304,98306,98361,98363,98843,131071,131072,131074,131554,162907,163840,163842,16///3897,163899,164379,196607,196608,196610,197090,215039,215040
                    (DEBUG_ERASE && strcmp("erase", style) == 0)) {
+		    //得到zero后的30及30个block编号,传给word
             word = strtok_r(NULL, " ", &wordsave);
+			//将word所有信息解析,保存到tgt结构体中.
             RangeSet* tgt = parse_range(word);
 
+			//tgt->size = 30个block组成的15个范围的 (右边-左边) 之和
             printf("  zeroing %d blocks\n", tgt->size);
 
+			//调用allocate, 分配BLOCKSIZE大小的内存给buffer,buffer_alloc保存实际分配成功的内存大小
             allocate(BLOCKSIZE, &buffer, &buffer_alloc);
+			//将buffer指向的BLOCKSIZE大小的这段内存全部写为0
             memset(buffer, 0, BLOCKSIZE);
+			//调用check_lseek取得15个block区间每个范围的左边.
             for (i = 0; i < tgt->count; ++i) {
                 check_lseek(fd, (off64_t)tgt->pos[i*2] * BLOCKSIZE, SEEK_SET);
+				//调用writeblock,向每个block区间写入 这个区间长度 次,每次将大小为BLOCKSIZE的内存块buffer写入到fd
                 for (j = tgt->pos[i*2]; j < tgt->pos[i*2+1]; ++j) {
+					// 由于buffer指向的内存都是0, 因此实现了填0操作.
                     writeblock(fd, buffer, BLOCKSIZE);
                 }
             }
 
             if (style[0] == 'z') {   // "zero" but not "erase"
+                //对于zero命令还要把一共填0的block的数目累加, 计算 total_blocks已经处理 的百分比
                 blocks_so_far += tgt->size;
                 fprintf(cmd_pipe, "set_progress %.4f\n", (double)blocks_so_far / total_blocks);
                 fflush(cmd_pipe);
@@ -459,8 +527,13 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
 
             free(tgt);
         } else if (strcmp("new", style) == 0) {
+            //new //30,0,32770,32825,32827,33307,65535,65536,65538,66018,98303,98304,98306,98361,98363,98843,131071,131072,131074,131554,162907,163840,163842,163897,163899,164379,196607,//196608,196610,197090,215039
+            //$ file system.new.dat
+            // system.new.dat: Linux rev 1.0 ext2 filesystem data, UUID=da594c53-9beb-f85c-85c5-cedf76546f7a, volume name "system" (extents) (large files)
 
+            // word 指向30后所有信息
             word = strtok_r(NULL, " ", &wordsave);
+            // tgt保存30后所有信息
             RangeSet* tgt = parse_range(word);
 
             printf("  writing %d blocks of new data\n", tgt->size);
@@ -488,6 +561,15 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
 
         } else if (strcmp("bsdiff", style) == 0 ||
                    strcmp("imgdiff", style) == 0) {
+            // bsdiff 0(patch_offset) 35581(patch_len) 67a63498a1293c14e23768bf7200348b8837e949 9c06e7e0277dee8c98e9a8b2a10d8649f6cfb3b0 2,367217,368194 979 2,367217,368196
+// imgdiff 134034 2022 192e81959ac1985b1d90962faae1286029d4f39e 021c103903aa2da3ef222e1da5bdccdee287d1c3 2,40903,41035 132 2,40904,41036
+// bsdiff 0(patch_offset) 35581(patch_len) 2,367217,368194(src_range) 2,367217,368196(tgt_range)
+// imgdiff 134034(patch_offset) 2022(patch_len) 2,40903,41035(src_range) 132 2,40904,41036(tgt_range)
+    //    bsdiff patchstart patchlen [src rangeset] [tgt rangeset]
+    //    imgdiff patchstart patchlen [src rangeset] [tgt rangeset]
+    //      - read the source blocks, apply a patch, write result to
+    //        target blocks.  bsdiff or imgdiff specifies the type of
+    //        patch.
             word = strtok_r(NULL, " ", &wordsave);
             size_t patch_offset = strtoul(word, NULL, 0);
             word = strtok_r(NULL, " ", &wordsave);
@@ -501,11 +583,13 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
             printf("  patching %d blocks to %d\n", src->size, tgt->size);
 
             // Read the source into memory.
+            //调用allocate, 分配BLOCKSIZE大小的内存给buffer,buffer_alloc保存实际分配成功的内存大小
             allocate(src->size * BLOCKSIZE, &buffer, &buffer_alloc);
             size_t p = 0;
             for (i = 0; i < src->count; ++i) {
                 check_lseek(fd, (off64_t)src->pos[i*2] * BLOCKSIZE, SEEK_SET);
                 size_t sz = (src->pos[i*2+1] - src->pos[i*2]) * BLOCKSIZE;
+                //从blockdev_filename->data中取偏移,将读到的内容保存到上面申请的buffer
                 readblock(fd, buffer+p, sz);
                 p += sz;
             }
@@ -513,6 +597,7 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
             Value patch_value;
             patch_value.type = VAL_BLOB;
             patch_value.size = patch_len;
+            //patch_start 指向的地址就是 ota zip包中文件system.patch.dat的地址
             patch_value.data = (char*)(patch_start + patch_offset);
 
             RangeSinkState rss;
@@ -533,7 +618,9 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
             }
 
             // We expect the output of the patcher to fill the tgt ranges exactly.
+            // 打完pathc后rss.p_block就是新生成的目标大小
             if (rss.p_block != tgt->count || rss.p_remain != 0) {
+                //对于ApplyImagePatch或ApplyBSDiffPatch,都是在RangeSinkWrite中完成rss->p_remain-=write_now 正常情况下rss.p_remain应为0
                 fprintf(stderr, "range sink underrun?\n");
             }
 
@@ -544,9 +631,13 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
             free(src);
             free(tgt);
         } else if (!DEBUG_ERASE && strcmp("erase", style) == 0) {
+            //DEBUG_ERASE 默认为0, 这时执行system.transfer.list中的erase命令时
+            //erase 14,546363,556544,557570,589312,590338,622080,623106,654848,655874,687616,688642,720384,721410,753152
             struct stat st;
+            //先根据open(blockdev_filename->data)读到的fd 判断target是不是块设备
             if (fstat(fd, &st) == 0 && S_ISBLK(st.st_mode)) {
                 word = strtok_r(NULL, " ", &wordsave);
+                // word 14,546363,....,753152
                 RangeSet* tgt = parse_range(word);
 
                 printf("  erasing %d blocks\n", tgt->size);
@@ -554,10 +645,14 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
                 for (i = 0; i < tgt->count; ++i) {
                     uint64_t range[2];
                     // offset in bytes
+                    // range[0] 每个区间的起始位置
                     range[0] = tgt->pos[i*2] * (uint64_t)BLOCKSIZE;
                     // len in bytes
+                    // range[1] 每个区间的长度
                     range[1] = (tgt->pos[i*2+1] - tgt->pos[i*2]) * (uint64_t)BLOCKSIZE;
 
+                    // #define BLKDISCARD _IO(0x12,119)blkdiscard is used to discard device sectors.This is useful for solid-state drivers (SSDs) and thinly-provisioned storage 
+                    //调用ioctl屏蔽range描述的块组区间
                     if (ioctl(fd, BLKDISCARD, &range) < 0) {
                         printf("    blkdiscard failed: %s\n", strerror(errno));
                     }

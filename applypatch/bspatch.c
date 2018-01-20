@@ -97,21 +97,33 @@ int FillBuffer(unsigned char* buffer, int size, bz_stream* stream) {
     return 0;
 }
 
+// 在GenerateTarget中调用ApplyBSDiffPatch:
+// result = ApplyBSDiffPatch(source_to_use->data, source_to_use->size,
+                // patch, 0, sink, token, &ctx);
+// 其中source_to_use->data -- 指向source的实际数据, 
+// source_to_use->size -- source实际数据的大小
+// patch -- 代表patch的数据机构object
+// 0  -- patch_offset
+// sink -- ApplyBSDiffPatch中在内存中生成了target的数据, 然后调用sink按对文件还是分区打patch的不同方式保存这些数据
+// token -- 最终输出生成target数据的地址
 int ApplyBSDiffPatch(const unsigned char* old_data, ssize_t old_size,
                      const Value* patch, ssize_t patch_offset,
                      SinkFn sink, void* token, SHA_CTX* ctx) {
 
     unsigned char* new_data;
     ssize_t new_size;
+	// 在ApplyBSDiffPatchMem中根据source和patch得到保存target数据和大小的new_data,new_size
     if (ApplyBSDiffPatchMem(old_data, old_size, patch, patch_offset,
                             &new_data, &new_size) != 0) {
         return -1;
     }
 
+	//通过sink调用传入的函数指针,对于分区就是applypatch.c中的MemorySink,对于文件就是FileSink
     if (sink(new_data, new_size, token) < new_size) {
         printf("short write of output: %d (%s)\n", errno, strerror(errno));
         return 1;
     }
+	// 在GenerateTarget调用ApplyBSDiffPatch前后分别调用了SHA_init,SHA_final, SHA_Init,SHA_Update,SHA_Final三个函数组合,计算出自己生成的target的SHA1值
     if (ctx) SHA_update(ctx, new_data, new_size);
     free(new_data);
 
@@ -140,6 +152,7 @@ int ApplyBSDiffPatchMem(const unsigned char* old_data, ssize_t old_size,
     }
 
     ssize_t ctrl_len, data_len;
+	//调用bspatch.c中的函数offtin,分别得到patch的第8,16,24位偏移 X,Y,sizeof(newfile)
     ctrl_len = offtin(header+8);
     data_len = offtin(header+16);
     *new_size = offtin(header+24);
