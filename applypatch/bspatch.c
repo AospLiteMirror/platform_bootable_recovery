@@ -66,6 +66,9 @@ void ShowBSDiffLicense() {
 
 static off_t offtin(u_char *buf)
 {
+    // https://stackoverflow.com/questions/9073667/where-to-find-the-complete-definition-of-off-t-type
+    // off_t:This is a signed integer type used to represent file sizes.
+    // If the source is compiled with _FILE_OFFSET_BITS == 64 this type is transparently replaced by off64_t.
     off_t y;
 
     y=buf[7]&0x7F;
@@ -101,12 +104,13 @@ int FillBuffer(unsigned char* buffer, int size, bz_stream* stream) {
 // 在GenerateTarget中调用ApplyBSDiffPatch:
 // result = ApplyBSDiffPatch(source_to_use->data, source_to_use->size,
                 // patch, 0, sink, token, &ctx);
-// 其中source_to_use->data -- 指向source的实际数据, 
-// source_to_use->size -- source实际数据的大小
-// patch -- 代表patch的数据机构object
-// 0  -- patch_offset
-// sink -- ApplyBSDiffPatchMem中在内存中生成了target的数据, 然后调用sink按对文件还是分区打patch的不同方式保存这些数据
-// token -- 最终输出生成target数据的地址
+// 其中source_to_use->old_data -- old_data -- 指向source的实际数据, 
+// source_to_use->old_size -- old_size -- source实际数据的大小
+// patch -- patch -- 代表patch的数据结构object
+// 0  -- patch_offset -- patch数据再整个patch文件中的偏移,对于bsdiff命令此值为0,对于imgdiff命令此值非0
+// sink -- sink -- ApplyBSDiffPatchMem中在内存中生成了target的数据, 然后调用sink按对文件还是分区打patch的不同方式保存这些数据
+// token -- token -- 最终输出生成target数据的地址
+// ctx -- ctx -- 
 int ApplyBSDiffPatch(const unsigned char* old_data, ssize_t old_size,
                      const Value* patch, ssize_t patch_offset,
                      SinkFn sink, void* token, SHA_CTX* ctx) {
@@ -150,6 +154,7 @@ int ApplyBSDiffPatchMem(const unsigned char* old_data, ssize_t old_size,
     // from oldfile to x bytes from the diff block; copy y bytes from the
     // extra block; seek forwards in oldfile by z bytes".
 
+	// header指向了真正要被apply的patch数据
     unsigned char* header = (unsigned char*) patch->data + patch_offset;
     if (memcmp(header, "BSDIFF40", 8) != 0) {
         printf("corrupt bsdiff patch file header (magic number)\n");
@@ -158,8 +163,11 @@ int ApplyBSDiffPatchMem(const unsigned char* old_data, ssize_t old_size,
 
     ssize_t ctrl_len, data_len;
 	//调用bspatch.c中的函数offtin,分别得到patch的第8,16,24位偏移 X,Y,sizeof(newfile)
+	// ctrl_len -- X -- length of bzip2ed ctrl block
     ctrl_len = offtin(header+8);
+    // data_len -- Y -- length of bzip2ed diff block 
     data_len = offtin(header+16);
+    // new_size -- sizeof(newfile) -- length of new file
     *new_size = offtin(header+24);
 
     if (ctrl_len < 0 || data_len < 0 || *new_size < 0) {
@@ -190,7 +198,9 @@ int ApplyBSDiffPatchMem(const unsigned char* old_data, ssize_t old_size,
     }
 
     bz_stream estream;
+    // next_in should point at the data to be compressed or decompressed
     estream.next_in = patch->data + patch_offset + 32 + ctrl_len + data_len;
+    // avail_in should indicate how many bytes the library may read
     estream.avail_in = patch->size - (patch_offset + 32 + ctrl_len + data_len);
     estream.bzalloc = NULL;
     estream.bzfree = NULL;

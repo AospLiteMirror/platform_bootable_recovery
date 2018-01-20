@@ -82,7 +82,7 @@ int ApplyImagePatch(const unsigned char* old_data, ssize_t old_size __unused,
     int num_chunks = Read4(header+8);
 
     int i;
-    // ApplyImagePatch之后就都是在for中循环处理补丁数据中每一个chunk
+    // ApplyImagePatch之后就都是在for中循环处理补丁数据中每一个chunk(厚块)
     // 对每个chunk,都是先读出开头4字节的chunk type,然后根据chunk type不同类型在不同条件分支中处理
     for (i = 0; i < num_chunks; ++i) {
         // each chunk's header record starts with 4 bytes.
@@ -109,10 +109,11 @@ int ApplyImagePatch(const unsigned char* old_data, ssize_t old_size __unused,
             // src_start和src_len都是对old_data指向的数据而言的
             size_t src_start = Read8(normal_header);
             size_t src_len = Read8(normal_header+8);
-            // patch_offset就是此chunk在整个imgdiff patch的文件头后对应的bsdiff patch格式的数据,
+            // patch_offset就是此chunk在整个imgdiff patch文件的文件头后对应的bsdiff patch格式的数据,
             // 相对整个imgdiff patch的偏移
             size_t patch_offset = Read8(normal_header+16);
 
+            // Normal chunks are simply patched using a plain bsdiff
             ApplyBSDiffPatch(old_data + src_start, src_len,
                              patch, patch_offset, sink, token, ctx);
         } else if (type == CHUNK_RAW) {
@@ -139,9 +140,11 @@ int ApplyImagePatch(const unsigned char* old_data, ssize_t old_size __unused,
                 printf("failed to write chunk %d raw data\n", i);
                 return -1;
             }
+            // CHUNK_RAW类型的chunk,在其chunk header的target len字段后面直接跟随这个chunk的data
             pos += data_len;
         } else if (type == CHUNK_DEFLATE) {
             // deflate chunks have an additional 60 bytes in their chunk header.
+            // deflate类型的chunk,其chunk header一共60字节
             char* deflate_header = patch->data + pos;
             pos += 60;
             if (pos > patch->size) {
@@ -152,6 +155,7 @@ int ApplyImagePatch(const unsigned char* old_data, ssize_t old_size __unused,
             size_t src_start = Read8(deflate_header);
             size_t src_len = Read8(deflate_header+8);
             size_t patch_offset = Read8(deflate_header+16);
+            // expanded len是未压缩的source数据的大小
             size_t expanded_len = Read8(deflate_header+24);
             size_t target_len = Read8(deflate_header+32);
             int level = Read4(deflate_header+40);
@@ -167,8 +171,11 @@ int ApplyImagePatch(const unsigned char* old_data, ssize_t old_size __unused,
             // the patch was constructed with bonus data.  The
             // deflation will come up 'bonus_size' bytes short; these
             // must be appended from the bonus_data value.
+            // DEFLATE类型的chunk,其bspatch格式的补丁数据是已经经过压缩的
+            // 判断是否存在bonus data,如果有就取得bonus data大小
             size_t bonus_size = (i == 1 && bonus_data != NULL) ? bonus_data->size : 0;
 
+            // expanded_source指向 申请的存放解压后的source数据的buffer 的起始地址
             unsigned char* expanded_source = malloc(expanded_len);
             if (expanded_source == NULL) {
                 printf("failed to allocate %zu bytes for expanded_source\n",
@@ -177,15 +184,21 @@ int ApplyImagePatch(const unsigned char* old_data, ssize_t old_size __unused,
             }
 
             z_stream strm;
+            // 不重要的三个参数:zalloc,zfree,opaque
             strm.zalloc = Z_NULL;
             strm.zfree = Z_NULL;
             strm.opaque = Z_NULL;
+            // avail_in:要压缩或解压的数据的长度
             strm.avail_in = src_len;
+            // next_in:指向要压缩或解压的数据起始位置的指针,old_data指向的就是source img中的数据
             strm.next_in = (unsigned char*)(old_data + src_start);
+            // avail_out:保存压缩或解压后数据的buffer的可用大小,刚开始为申请大小=expanded_len
             strm.avail_out = expanded_len;
+            // next_out:指向保存压缩或解压后数据的buffer的指针
             strm.next_out = expanded_source;
 
             int ret;
+            //调用zlib的inflateInit:解压初始化的基础函数
             ret = inflateInit2(&strm, -15);
             if (ret != Z_OK) {
                 printf("failed to init source inflation: %d\n", ret);
@@ -194,6 +207,7 @@ int ApplyImagePatch(const unsigned char* old_data, ssize_t old_size __unused,
 
             // Because we've provided enough room to accommodate the output
             // data, we expect one call to inflate() to suffice.
+            // infalte : 解压函数 调用一次inflate解压完source
             ret = inflate(&strm, Z_SYNC_FLUSH);
             if (ret != Z_STREAM_END) {
                 printf("source inflation returned %d\n", ret);
@@ -201,12 +215,14 @@ int ApplyImagePatch(const unsigned char* old_data, ssize_t old_size __unused,
             }
             // We should have filled the output buffer exactly, except
             // for the bonus_size.
+            // 这时buffer剩余大小应该等于bonus_size
             if (strm.avail_out != bonus_size) {
                 printf("source inflation short by %zu bytes\n", strm.avail_out-bonus_size);
                 return -1;
             }
             inflateEnd(&strm);
 
+            // 将 bonus拷贝到 存放解压后的source数据的buffer中(expanded_len - bonus_size)地址
             if (bonus_size) {
                 memcpy(expanded_source + (expanded_len - bonus_size),
                        bonus_data->data, bonus_size);
@@ -214,6 +230,7 @@ int ApplyImagePatch(const unsigned char* old_data, ssize_t old_size __unused,
 
             // Next, apply the bsdiff patch (in memory) to the uncompressed
             // data.
+            // 然后调用ApplyBSDiffPatchMem,对上面得到的uncompressed的source data应用内存中的bsdiff patch 
             unsigned char* uncompressed_target_data;
             ssize_t uncompressed_target_size;
             if (ApplyBSDiffPatchMem(expanded_source, expanded_len,
@@ -224,9 +241,12 @@ int ApplyImagePatch(const unsigned char* old_data, ssize_t old_size __unused,
             }
 
             // Now compress the target data and append it to the output.
+            // 最后再压缩通过ApplyBSDiffPatchMem得到的target data--uncompressed_target_data
 
             // we're done with the expanded_source data buffer, so we'll
             // reuse that memory to receive the output of deflate.
+            // expanded_source指向用来保存解压后的source数据的buffer,在之前已经用了
+            // 因此现在可以重新用于保存 上面target data压缩后的数据
             unsigned char* temp_data = expanded_source;
             ssize_t temp_size = expanded_len;
             if (temp_size < 32768) {
@@ -241,15 +261,24 @@ int ApplyImagePatch(const unsigned char* old_data, ssize_t old_size __unused,
             strm.zalloc = Z_NULL;
             strm.zfree = Z_NULL;
             strm.opaque = Z_NULL;
+            // avail_in:要压缩的数据的长度
             strm.avail_in = uncompressed_target_size;
+            // next_in:指向要压缩或解压的数据起始位置的指针
             strm.next_in = uncompressed_target_data;
+            // 
             ret = deflateInit2(&strm, level, method, windowBits, memLevel, strategy);
             do {
+                // avail_out:保存压缩或解压后数据的buffer的可用大小
                 strm.avail_out = temp_size;
+                // next_out:指向保存压缩或解压后数据的buffer的指针
                 strm.next_out = temp_data;
+                // 调用deflate完成压缩
                 ret = deflate(&strm, Z_FINISH);
+                // temp_size为一共要压缩数据大小,avail_out为
+                // 因此have为 已经得到的压缩后的数据的大小
                 ssize_t have = temp_size - strm.avail_out;
 
+                // 调用sink指向的函数将压缩后数据写入flash
                 if (sink(temp_data, have, token) != have) {
                     printf("failed to write %ld compressed bytes to output\n",
                            (long)have);
