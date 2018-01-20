@@ -39,6 +39,16 @@
 // patch -- 代表patch的数据机构object
 // sink -- ApplyBSDiffPatch中在内存中生成了target的数据, 然后调用sink按对文件还是分区打patch的不同方式保存这些数据
 // token -- 最终输出生成target数据的地址
+
+// 在BlockImageUpdateFn中在解析imgdiif命令后调用ApplyImagePatch:
+// old_data -- buffer -- imgdiif将src rangset中的数据读取到了一段buffer指向的内存中
+// __unused
+// patch -- patch_value -- 补丁相关数据
+// sink -- RangeSinkWrite
+// token -- rss -- 
+// ctx -- NULL
+// bonus_data -- NULL
+
 /*
  * Apply the patch given in 'patch_filename' to the source data given
  * by (old_data, old_size).  Write the patched output to the 'output'
@@ -49,10 +59,12 @@ int ApplyImagePatch(const unsigned char* old_data, ssize_t old_size __unused,
                     const Value* patch,
                     SinkFn sink, void* token, SHA_CTX* ctx,
                     const Value* bonus_data) {
-	//imgdiff生成的patch,头8字节后还有4字节chunk count
+	//imgdiff生成的补丁数据,头8字节(magic number and version),之后还有4字节代表chunk count
     ssize_t pos = 12;
+    // header指向补丁数据的首地址
     char* header = patch->data;
 	//imgdiff生成的patch,头8字节后还有4字节chunk count
+	//patch->size代表补丁数据的长度,如果从BlockImageUpdateFn调用过来,就是bsdiff或imgdiff命令后面第2个参数
     if (patch->size < 12) {
         printf("patch too short to contain header\n");
         return -1;
@@ -66,16 +78,19 @@ int ApplyImagePatch(const unsigned char* old_data, ssize_t old_size __unused,
         return -1;
     }
 
-	//从patch的head编译8字节,读取之后的4个字节
+	//从补丁数据的head后移8字节,读取之后的4个字节,代表chunk count
     int num_chunks = Read4(header+8);
 
     int i;
+    // ApplyImagePatch之后就都是在for中循环处理每一个chunk
+    // 对每个chunk,都是先读出开头4字节的chunk type,然后根据chunk type不同类型在不同条件分支中处理
     for (i = 0; i < num_chunks; ++i) {
         // each chunk's header record starts with 4 bytes.
         if (pos + 4 > patch->size) {
             printf("failed to read chunk %d record\n", i);
             return -1;
         }
+        // 读取每个chunk开始的四字节,代表chunk type,
         int type = Read4(patch->data + pos);
         pos += 4;
 

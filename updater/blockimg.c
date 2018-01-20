@@ -172,17 +172,25 @@ static int check_lseek(int fd, off64_t offset, int whence) {
     return 0;
 }
 
+// 申请一段内存,buffer指向首地址
+// buffer -- 申请到的内存的首地址
+// buffer_alloc -- 已经申请到的内存的大小, 以1个BLOCKSIZE(4096字节)为单位
+// size -- 要申请的内存的大小, 以1个BLOCKSIZE为单位
 static void allocate(size_t size, uint8_t** buffer, size_t* buffer_alloc) {
     // if the buffer's big enough, reuse it.
+    // 如果buffer_alloc >= size, 说明buffer指向的内存>=size,就没必须继续申请,可以重用buffer,
     if (size <= *buffer_alloc) return;
 
+    // 开始申请,先清空这段buffer
     free(*buffer);
 
+    // 调用malloc真正申请内存
     *buffer = (uint8_t*) malloc(size);
     if (*buffer == NULL) {
         fprintf(stderr, "failed to allocate %zu bytes\n", size);
         exit(1);
     }
+    // 这时将buffer_alloc大小记为size
     *buffer_alloc = size;
 }
 
@@ -413,8 +421,10 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
         goto done;
     }
 
-	//计算出patch_entry的起始地址，因为注释中说patch stream must be uncompressed
-	//patch_start在下面循环中执行bsdiff或imgdiff命令中会用到
+	// 计算出patch_entry的起始地址patch_start，因为注释中说patch stream must be uncompressed
+	// patch_start在下面循环中执行bsdiff或imgdiff命令中会用到
+	// package_zip_addr + mzGetZipEntryOffset(patch_entry) zip安装包在内存中的绝对地址+ system.patch.dat在zip包内的相对偏移地址
+	// 因此patch_start就代表压缩包中system.patch.dat文件在内存中的绝对地址
     uint8_t* patch_start = ((UpdaterInfo*)(state->cookie))->package_zip_addr +
         mzGetZipEntryOffset(patch_entry);
 
@@ -500,7 +510,8 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
 	// 因此在BlockImageUpdateFn中将会创建出一个线程,
     //线程标识符--new_data_thread,   //线程属性attr设置为了PTHREAD_CREATE_JOINABLE,代表非分离线程,非分离的线程终止时，其线程ID和退出状态将保留，直到另外一个线程调用pthread_join.
     // 线程函数的起始地址, 这里就是执行unzip_new_data函数
-    //nti--传给unzip_new_data函数的参数 
+    //nti--传给unzip_new_data函数的参数
+    // 创建名为调用unzip_new_data的现场,在其中执行unzip_new_data,在unzip_new_data中调用mzProcessZipEntryContents完成对system.new.data文件的解压
     pthread_create(&new_data_thread, &attr, unzip_new_data, &nti);
 
     int i, j;
@@ -534,6 +545,7 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
 	//按行分割读取system.transfer.list中的命令
     transfer_list[transfer_list_value->size] = '\0';
 
+    // 读取transfer.list文件的第1行
     line = strtok_r(transfer_list, "\n", &linesave);
 
     // first line in transfer list is the version number; currently
@@ -548,13 +560,16 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
 
     // second line in transfer list is the total number of blocks we
     // expect to write.
+    // 读取transfer.list文件的第2行
     line = strtok_r(NULL, "\n", &linesave);
     int total_blocks = strtol(line, NULL, 0);
     // shouldn't happen, but avoid divide by zero.
     if (total_blocks == 0) ++total_blocks;
+    // blocks_so_far含义为目前已经写入的blocks数目,最大值是total_blocks
     int blocks_so_far = 0;
 
     uint8_t* buffer = NULL;
+    // buffer_alloc为已经分配的内存大小
     size_t buffer_alloc = 0;
 
     // third and subsequent lines are all individual transfer commands.
@@ -565,10 +580,11 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
         char* style;
         style = strtok_r(line, " ", &wordsave);
 
+		// V1:move [src rangeset] [tgt rangeset] copy data from source blocks to target blocks (no patch needed; rangesets are the same size)
+		// move 2,545836,545840 2,545500,545504
 		// move b569d4f018e1cdda840f427eddc08a57b93d8c2e(sha1加密值,长度为40位) 2,545836,545840 4 2,545500,545504
         // sha256--64 sha512--128
-        // move 2,545836,545840 2,545500,545504
-		//处理system.transfer.list中的move命令
+		//处理system.transfer.list中的move命令 
         if (strcmp("move", style) == 0) {
             word = strtok_r(NULL, " ", &wordsave);
 			//将2,545836,545840 解析为src的range
@@ -579,7 +595,8 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
 
             printf("  moving %d blocks\n", src->size);
 
-			//按src range大小申请buffer, 申请成功块个数记为buffer_alloc,正常情况下*buffer_alloc = size
+			// 按src range的block个数(src->size)申请内存, buffer指向申请到的内存首地址, 申请成功块个数传给buffer_alloc,正常情况下*buffer_alloc = size
+			// 在allocate中会比较size和buffer_alloc,根据buffer_alloc含义,如果>size,就可以重用buffer,allocate可以直接返回
             allocate(src->size * BLOCKSIZE, &buffer, &buffer_alloc);
             size_t p = 0;
             for (i = 0; i < src->count; ++i) {
@@ -599,7 +616,8 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
                 p += sz;
             }
 
-			//blocks_so_far在 for (line = strtok_r(NULL, "\n", &linesave)开始前初始化为0
+			//blocks_so_far在 for (line = strtok_r(NULL, "\n", &linesave)循环外面开始前初始化为0
+			// 这里每执行完一次move,就累积这个move指令写入的block个数到blocks_so_far
             blocks_so_far += tgt->size;
 			//total_blocks是从transfer.list第二行读取的值,代表总共要写入的block数目
             fprintf(cmd_pipe, "set_progress %.4f\n", (double)blocks_so_far / total_blocks);
@@ -609,6 +627,8 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
             free(tgt);
 
         } else if (strcmp("zero", style) == 0 ||
+        // V1:zero [rangeset] fill the indicated blocks with zeros
+        // V1:erase [rangeset] mark the given blocks as empty
 		//处理zero, 如果定义了DEBUG_ERASE为1, 这时erase mean fill the region with zeroes, 和zero的行为实际一样
 		//zero //30,32770,32825,32827,33307,65535,65536,65538,66018,98303,98304,98306,98361,98363,98843,131071,131072,131074,131554,162907,163840,163842,16///3897,163899,164379,196607,196608,196610,197090,215039,215040
                    (DEBUG_ERASE && strcmp("erase", style) == 0)) {
@@ -617,7 +637,7 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
 			//将word所有信息解析,保存到tgt结构体中.
             RangeSet* tgt = parse_range(word);
 
-			//tgt->size = 30个block组成的15个范围的 (右边-左边) 之和
+			//tgt->size = 30个block编号组成的15个范围的 (右边-左边) 之和
             printf("  zeroing %d blocks\n", tgt->size);
 
 			//调用allocate, 分配BLOCKSIZE大小的内存给buffer,buffer_alloc保存实际分配成功的内存大小
@@ -643,6 +663,9 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
 
             free(tgt);
         } else if (strcmp("new", style) == 0) {
+            // V1:new [rangeset] - fill the blocks with data read from the new_data file
+            // 将rangeset代表的xx个block区间内的所有block,用从system.new.dat中解压出来的数据填充
+            // system.new.dat中保存的是system分区新版本相对于旧版本完全新增的文件 system.patch.dat中保存的是
             //new //30,0,32770,32825,32827,33307,65535,65536,65538,66018,98303,98304,98306,98361,98363,98843,131071,131072,131074,131554,162907,163840,163842,163897,163899,164379,196607,//196608,196610,197090,215039
             //$ file system.new.dat
             // system.new.dat: Linux rev 1.0 ext2 filesystem data, UUID=da594c53-9beb-f85c-85c5-cedf76546f7a, volume name "system" (extents) (large files)
@@ -658,9 +681,12 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
             rss.fd = fd;
             rss.tgt = tgt;
             rss.p_block = 0;
+            // p_remain保存每个block区间block个数
             rss.p_remain = (tgt->pos[1] - tgt->pos[0]) * BLOCKSIZE;
+            // 设置要写入的偏移位置
             check_lseek(fd, (off64_t)tgt->pos[0] * BLOCKSIZE, SEEK_SET);
 
+            // 在new_data_thread子线程中真正完成system.new.dat的解压和把其中数据写入systen分区操作
             pthread_mutex_lock(&nti.mu);
             nti.rss = &rss;
             pthread_cond_broadcast(&nti.cv);
@@ -669,6 +695,8 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
             }
             pthread_mutex_unlock(&nti.mu);
 
+            // move,zero,new,imgdiff,bsdiff都要统计实际写入flash的block个数,erase不同统计
+            // 一条命令执行完后统计一次,而不是一条命令内的每个block都逐一统计
             blocks_so_far += tgt->size;
             fprintf(cmd_pipe, "set_progress %.4f\n", (double)blocks_so_far / total_blocks);
             fflush(cmd_pipe);
@@ -677,6 +705,7 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
 
         } else if (strcmp("bsdiff", style) == 0 ||
                    strcmp("imgdiff", style) == 0) {
+            // V1:bsdiff patchstart patchlen [src rangeset] [tgt rangeset] imgdiff patchstart patchlen [src rangeset] [tgt rangeset] read the source blocks, apply a patch, write result to target blocks.
             // bsdiff 0(patch_offset) 35581(patch_len) 67a63498a1293c14e23768bf7200348b8837e949 9c06e7e0277dee8c98e9a8b2a10d8649f6cfb3b0 2,367217,368194 979 2,367217,368196
 // imgdiff 134034 2022 192e81959ac1985b1d90962faae1286029d4f39e 021c103903aa2da3ef222e1da5bdccdee287d1c3 2,40903,41035 132 2,40904,41036
 // bsdiff 0(patch_offset) 35581(patch_len) 2,367217,368194(src_range) 2,367217,368196(tgt_range)
@@ -687,8 +716,10 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
     //        target blocks.  bsdiff or imgdiff specifies the type of
     //        patch.
             word = strtok_r(NULL, " ", &wordsave);
+            // 将bsdiff或imgdiff命令后面第1个参数传给patch_offset
             size_t patch_offset = strtoul(word, NULL, 0);
             word = strtok_r(NULL, " ", &wordsave);
+             // 将bsdiff或imgdiff命令后面第2个参数传给patch_offset
             size_t patch_len = strtoul(word, NULL, 0);
 
             word = strtok_r(NULL, " ", &wordsave);
@@ -699,9 +730,10 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
             printf("  patching %d blocks to %d\n", src->size, tgt->size);
 
             // Read the source into memory.
-            //调用allocate, 分配BLOCKSIZE大小的内存给buffer,buffer_alloc保存实际分配成功的内存大小
+            //调用allocate, 分配一段内存buffer,buffer_alloc保存实际分配成功的内存大小
             allocate(src->size * BLOCKSIZE, &buffer, &buffer_alloc);
             size_t p = 0;
+            // 在这个for中把src rangeset表示的所有block区间的数据读到buffer指向的内存中
             for (i = 0; i < src->count; ++i) {
                 check_lseek(fd, (off64_t)src->pos[i*2] * BLOCKSIZE, SEEK_SET);
                 size_t sz = (src->pos[i*2+1] - src->pos[i*2]) * BLOCKSIZE;
@@ -713,7 +745,8 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
             Value patch_value;
             patch_value.type = VAL_BLOB;
             patch_value.size = patch_len;
-            //patch_start 指向的地址就是 ota zip包中文件system.patch.dat的地址
+            // patch_start是ota压缩包中system.patch.dat文件在内存中的绝对地址, patch_offset是imgdiff或bsdiff命令要打的补丁数据在system.patch.dat中的相对地址
+            // 因此patch_value.data指向的就是此补丁数据在system.patch.dat中的绝对地址
             patch_value.data = (char*)(patch_start + patch_offset);
 
             RangeSinkState rss;
@@ -747,6 +780,7 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
             free(src);
             free(tgt);
         } else if (!DEBUG_ERASE && strcmp("erase", style) == 0) {
+            // DEBUG_ERASE:Set this to 0 to interpret 'erase' transfers to mean do a BLKDISCARD ioctl (the normal behavior).
             //DEBUG_ERASE 默认为0, 这时执行system.transfer.list中的erase命令时
             //erase 14,546363,556544,557570,589312,590338,622080,623106,654848,655874,687616,688642,720384,721410,753152
             struct stat st;
@@ -784,11 +818,14 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
         }
     }
 
+    // 调用pthread_join等待子线程new_data_thread的结束
     pthread_join(new_data_thread, NULL);
     success = true;
 
     free(buffer);
+    // blocks_so_far为实际写入的block个数,total_blocks为升级脚本第二行计划写入的block个数.正常情况下两者相等.
     printf("wrote %d blocks; expected %d\n", blocks_so_far, total_blocks);
+    // 这是buffer_alloc的大小就是执行transfer.list中命令过程中最大分配的一段内存大小
     printf("max alloc needed was %zu\n", buffer_alloc);
 
   done:
