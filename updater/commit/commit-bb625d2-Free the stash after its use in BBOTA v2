@@ -1,0 +1,33 @@
+From bb625d2099406c66c0c1da90416fba1cd38ea413 Mon Sep 17 00:00:00 2001
+From: Tao Bao <tbao@google.com>
+Date: Thu, 13 Aug 2015 14:44:15 -0700
+Subject: Free the stash after its use in BBOTA v2.
+
+In BBOTA v2, the stash size computation is inaccurate. A stash will be
+used only once, so we deduct its size from stashed_blocks right after
+its use. However, the stash doesn't actually get freed until being
+overwritten by another stash or destroyed at the end of an update. This
+leads to OTA failures due to insufficient space on /cache. This CL
+changes the BBOTA v2 script to generate an explicit free right after
+its use.
+
+Bug: 23119955
+Change-Id: Icdd8352bb0ff778945937c870990a888c7a4d38b
+
+diff --git a/tools/releasetools/blockimgdiff.py b/tools/releasetools/blockimgdiff.py
+index a32c6b1e1..e042e03cb 100644
+--- a/tools/releasetools/blockimgdiff.py
++++ b/tools/releasetools/blockimgdiff.py
+@@ -350,6 +350,12 @@ class BlockImageDiff(object):
+           mapped_stashes.append(sr)
+           if self.version == 2:
+             src_str.append("%d:%s" % (sid, sr.to_string_raw()))
++            # A stash will be used only once. We need to free the stash
++            # immediately after the use, instead of waiting for the automatic
++            # clean-up at the end. Because otherwise it may take up extra space
++            # and lead to OTA failures.
++            # Bug: 23119955
++            free_string.append("free %d\n" % (sid,))
+           else:
+             assert sh in stashes
+             src_str.append("%s:%s" % (sh, sr.to_string_raw()))

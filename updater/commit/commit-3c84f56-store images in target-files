@@ -1,0 +1,831 @@
+From 3c84f569487c4e59baa332be33b5430fdefb76b3 Mon Sep 17 00:00:00 2001
+From: Doug Zongker <dougz@google.com>
+Date: Thu, 31 Jul 2014 11:06:30 -0700
+Subject: store images in target-files
+
+Store sparse images in the target-files, and use those (when they're
+available) for building block OTAs.
+
+- New script add_img_to_target_files is added to make the images and
+  add them to the IMAGES/ subdir in the target-files.  It gets run
+  from the Makefile when building a target-files.
+
+- img_from_target_files becomes mostly vestigial: it creates the
+  img.zip by just copying the images out of the target-files.  (It
+  still knows how to build images for use on older target-files.)
+
+- ota_from_target_files uses images from the target-files in
+  preference to rebuilding images from the source files.
+
+- sign_apk_target_files builds images and includes them in its output
+  target files (even if the input target-files didn't have them).
+
+Bug: 16488065
+Change-Id: I444e0d722d636978209467ffc01750a585c6db75
+
+diff --git a/core/Makefile b/core/Makefile
+index 36d53e11f..c556ed780 100644
+--- a/core/Makefile
++++ b/core/Makefile
+@@ -1415,6 +1415,7 @@ endif
+ 	$(hide) zipinfo -1 $@ | awk 'BEGIN { FS="BOOT/RAMDISK/" } /^BOOT\/RAMDISK\// {print $$2}' | $(HOST_OUT_EXECUTABLES)/fs_config -C -S $(SELINUX_FC) > $(zip_root)/META/boot_filesystem_config.txt
+ 	$(hide) zipinfo -1 $@ | awk 'BEGIN { FS="RECOVERY/RAMDISK/" } /^RECOVERY\/RAMDISK\// {print $$2}' | $(HOST_OUT_EXECUTABLES)/fs_config -C -S $(SELINUX_FC) > $(zip_root)/META/recovery_filesystem_config.txt
+ 	$(hide) (cd $(zip_root) && zip -q ../$(notdir $@) META/*filesystem_config.txt)
++	$(hide) ./build/tools/releasetools/add_img_to_target_files $@
+ 
+ .PHONY: target-files-package
+ target-files-package: $(BUILT_TARGET_FILES_PACKAGE)
+diff --git a/tools/releasetools/add_img_to_target_files b/tools/releasetools/add_img_to_target_files
+new file mode 120000
+index 000000000..04323bd15
+--- /dev/null
++++ b/tools/releasetools/add_img_to_target_files
+@@ -0,0 +1 @@
++add_img_to_target_files.py
+\ No newline at end of file
+diff --git a/tools/releasetools/add_img_to_target_files.py b/tools/releasetools/add_img_to_target_files.py
+new file mode 100755
+index 000000000..7be1929b3
+--- /dev/null
++++ b/tools/releasetools/add_img_to_target_files.py
+@@ -0,0 +1,284 @@
++#!/usr/bin/env python
++#
++# Copyright (C) 2014 The Android Open Source Project
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#      http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""
++Given a target-files zipfile that does not contain images (ie, does
++not have an IMAGES/ top-level subdirectory), produce the images and
++add them to the zipfile.
++
++Usage:  add_img_to_target_files target_files
++"""
++
++import sys
++
++if sys.hexversion < 0x02070000:
++  print >> sys.stderr, "Python 2.7 or newer is required."
++  sys.exit(1)
++
++import errno
++import os
++import re
++import shutil
++import subprocess
++import tempfile
++import zipfile
++
++# missing in Python 2.4 and before
++if not hasattr(os, "SEEK_SET"):
++  os.SEEK_SET = 0
++
++import build_image
++import common
++
++OPTIONS = common.OPTIONS
++
++
++def AddSystem(output_zip, sparse=True, prefix="IMAGES/"):
++  """Turn the contents of SYSTEM into a system image and store it in
++  output_zip."""
++  data = BuildSystem(OPTIONS.input_tmp, OPTIONS.info_dict, sparse=sparse)
++  common.ZipWriteStr(output_zip, prefix + "system.img", data)
++
++def BuildSystem(input_dir, info_dict, sparse=True, map_file=None):
++  return CreateImage(input_dir, info_dict, "system",
++                     sparse=sparse, map_file=map_file)
++
++def AddVendor(output_zip, sparse=True, prefix="IMAGES/"):
++  data = BuildVendor(OPTIONS.input_tmp, OPTIONS.info_dict, sparse=sparse)
++  common.ZipWriteStr(output_zip, prefix + "vendor.img", data)
++
++def BuildVendor(input_dir, info_dict, sparse=True, map_file=None):
++  return CreateImage(input_dir, info_dict, "vendor",
++                     sparse=sparse, map_file=map_file)
++
++
++def CreateImage(input_dir, info_dict, what, sparse=True, map_file=None):
++  print "creating " + what + ".img..."
++
++  img = tempfile.NamedTemporaryFile()
++
++  # The name of the directory it is making an image out of matters to
++  # mkyaffs2image.  It wants "system" but we have a directory named
++  # "SYSTEM", so create a symlink.
++  try:
++    os.symlink(os.path.join(input_dir, what.upper()),
++               os.path.join(input_dir, what))
++  except OSError, e:
++      # bogus error on my mac version?
++      #   File "./build/tools/releasetools/img_from_target_files", line 86, in AddSystem
++      #     os.path.join(OPTIONS.input_tmp, "system"))
++      # OSError: [Errno 17] File exists
++    if (e.errno == errno.EEXIST):
++      pass
++
++  image_props = build_image.ImagePropFromGlobalDict(info_dict, what)
++  fstab = info_dict["fstab"]
++  if fstab:
++    image_props["fs_type" ] = fstab["/" + what].fs_type
++
++  if what == "system":
++    fs_config_prefix = ""
++  else:
++    fs_config_prefix = what + "_"
++
++  fs_config = os.path.join(
++      input_dir, "META/" + fs_config_prefix + "filesystem_config.txt")
++  if not os.path.exists(fs_config): fs_config = None
++
++  fc_config = os.path.join(input_dir, "BOOT/RAMDISK/file_contexts")
++  if not os.path.exists(fc_config): fc_config = None
++
++  succ = build_image.BuildImage(os.path.join(input_dir, what),
++                                image_props, img.name,
++                                fs_config=fs_config,
++                                fc_config=fc_config)
++  assert succ, "build " + what + ".img image failed"
++
++  mapdata = None
++
++  if sparse:
++    data = open(img.name).read()
++    img.close()
++  else:
++    success, name = build_image.UnsparseImage(img.name, replace=False)
++    if not success:
++      assert False, "unsparsing " + what + ".img failed"
++
++    if map_file:
++      mmap = tempfile.NamedTemporaryFile()
++      mimg = tempfile.NamedTemporaryFile(delete=False)
++      success = build_image.MappedUnsparseImage(
++          img.name, name, mmap.name, mimg.name)
++      if not success:
++        assert False, "creating sparse map failed"
++      os.unlink(name)
++      name = mimg.name
++
++      with open(mmap.name) as f:
++        mapdata = f.read()
++
++    try:
++      with open(name) as f:
++        data = f.read()
++    finally:
++      os.unlink(name)
++
++  if mapdata is None:
++    return data
++  else:
++    return mapdata, data
++
++
++def AddUserdata(output_zip, prefix="IMAGES/"):
++  """Create an empty userdata image and store it in output_zip."""
++
++  image_props = build_image.ImagePropFromGlobalDict(OPTIONS.info_dict,
++                                                    "data")
++  # We only allow yaffs to have a 0/missing partition_size.
++  # Extfs, f2fs must have a size. Skip userdata.img if no size.
++  if (not image_props.get("fs_type", "").startswith("yaffs") and
++      not image_props.get("partition_size")):
++    return
++
++  print "creating userdata.img..."
++
++  # The name of the directory it is making an image out of matters to
++  # mkyaffs2image.  So we create a temp dir, and within it we create an
++  # empty dir named "data", and build the image from that.
++  temp_dir = tempfile.mkdtemp()
++  user_dir = os.path.join(temp_dir, "data")
++  os.mkdir(user_dir)
++  img = tempfile.NamedTemporaryFile()
++
++  fstab = OPTIONS.info_dict["fstab"]
++  if fstab:
++    image_props["fs_type" ] = fstab["/data"].fs_type
++  succ = build_image.BuildImage(user_dir, image_props, img.name)
++  assert succ, "build userdata.img image failed"
++
++  common.CheckSize(img.name, "userdata.img", OPTIONS.info_dict)
++  output_zip.write(img.name, prefix + "userdata.img")
++  img.close()
++  os.rmdir(user_dir)
++  os.rmdir(temp_dir)
++
++
++def AddCache(output_zip, prefix="IMAGES/"):
++  """Create an empty cache image and store it in output_zip."""
++
++  image_props = build_image.ImagePropFromGlobalDict(OPTIONS.info_dict,
++                                                    "cache")
++  # The build system has to explicitly request for cache.img.
++  if "fs_type" not in image_props:
++    return
++
++  print "creating cache.img..."
++
++  # The name of the directory it is making an image out of matters to
++  # mkyaffs2image.  So we create a temp dir, and within it we create an
++  # empty dir named "cache", and build the image from that.
++  temp_dir = tempfile.mkdtemp()
++  user_dir = os.path.join(temp_dir, "cache")
++  os.mkdir(user_dir)
++  img = tempfile.NamedTemporaryFile()
++
++  fstab = OPTIONS.info_dict["fstab"]
++  if fstab:
++    image_props["fs_type" ] = fstab["/cache"].fs_type
++  succ = build_image.BuildImage(user_dir, image_props, img.name)
++  assert succ, "build cache.img image failed"
++
++  common.CheckSize(img.name, "cache.img", OPTIONS.info_dict)
++  output_zip.write(img.name, prefix + "cache.img")
++  img.close()
++  os.rmdir(user_dir)
++  os.rmdir(temp_dir)
++
++
++def AddImagesToTargetFiles(filename):
++  OPTIONS.input_tmp, input_zip = common.UnzipTemp(filename)
++  try:
++
++    for n in input_zip.namelist():
++      if n.startswith("IMAGES/"):
++        print "target_files appears to already contain images."
++        sys.exit(1)
++
++    try:
++      input_zip.getinfo("VENDOR/")
++      has_vendor = True
++    except KeyError:
++      has_vendor = False
++
++    OPTIONS.info_dict = common.LoadInfoDict(input_zip)
++    if "selinux_fc" in OPTIONS.info_dict:
++      OPTIONS.info_dict["selinux_fc"] = os.path.join(
++          OPTIONS.input_tmp, "BOOT", "RAMDISK", "file_contexts")
++
++    input_zip.close()
++    output_zip = zipfile.ZipFile(filename, "a",
++                                 compression=zipfile.ZIP_DEFLATED)
++
++    def banner(s):
++      print "\n\n++++ " + s + " ++++\n\n"
++
++    banner("boot")
++    boot_image = common.GetBootableImage(
++        "IMAGES/boot.img", "boot.img", OPTIONS.input_tmp, "BOOT")
++    if boot_image:
++      boot_image.AddToZip(output_zip)
++
++    banner("recovery")
++    recovery_image = common.GetBootableImage(
++        "IMAGES/recovery.img", "recovery.img", OPTIONS.input_tmp, "RECOVERY")
++    if recovery_image:
++      recovery_image.AddToZip(output_zip)
++
++    banner("system")
++    AddSystem(output_zip)
++    if has_vendor:
++      banner("vendor")
++      AddVendor(output_zip)
++    banner("userdata")
++    AddUserdata(output_zip)
++    banner("cache")
++    AddCache(output_zip)
++
++    output_zip.close()
++
++  finally:
++    shutil.rmtree(OPTIONS.input_tmp)
++
++
++def main(argv):
++  args = common.ParseOptions(argv, __doc__)
++
++  if len(args) != 1:
++    common.Usage(__doc__)
++    sys.exit(1)
++
++  AddImagesToTargetFiles(args[0])
++  print "done."
++
++if __name__ == '__main__':
++  try:
++    common.CloseInheritedPipes()
++    main(sys.argv[1:])
++  except common.ExternalError, e:
++    print
++    print "   ERROR: %s" % (e,)
++    print
++    sys.exit(1)
+diff --git a/tools/releasetools/img_from_target_files.py b/tools/releasetools/img_from_target_files.py
+index 9aab41c25..6463047e7 100755
+--- a/tools/releasetools/img_from_target_files.py
++++ b/tools/releasetools/img_from_target_files.py
+@@ -20,9 +20,6 @@ use with 'fastboot update'.
+ 
+ Usage:  img_from_target_files [flags] input_target_files output_image_zip
+ 
+-  -b  (--board_config)  <file>
+-      Deprecated.
+-
+   -z  (--bootable_zip)
+       Include only the bootable images (eg 'boot' and 'recovery') in
+       the output.
+@@ -47,174 +44,11 @@ import zipfile
+ if not hasattr(os, "SEEK_SET"):
+   os.SEEK_SET = 0
+ 
+-import build_image
+ import common
+ 
+ OPTIONS = common.OPTIONS
+ 
+ 
+-def AddSystem(output_zip, sparse=True):
+-  """Turn the contents of SYSTEM into a system image and store it in
+-  output_zip."""
+-  data = BuildSystem(OPTIONS.input_tmp, OPTIONS.info_dict, sparse=sparse)
+-  common.ZipWriteStr(output_zip, "system.img", data)
+-
+-def BuildSystem(input_dir, info_dict, sparse=True, map_file=None):
+-  return CreateImage(input_dir, info_dict, "system",
+-                     sparse=sparse, map_file=map_file)
+-
+-def AddVendor(output_zip, sparse=True):
+-  data = BuildVendor(OPTIONS.input_tmp, OPTIONS.info_dict, sparse=sparse)
+-  common.ZipWriteStr(output_zip, "vendor.img", data)
+-
+-def BuildVendor(input_dir, info_dict, sparse=True, map_file=None):
+-  return CreateImage(input_dir, info_dict, "vendor",
+-                     sparse=sparse, map_file=map_file)
+-
+-
+-def CreateImage(input_dir, info_dict, what, sparse=True, map_file=None):
+-  print "creating " + what + ".img..."
+-
+-  img = tempfile.NamedTemporaryFile()
+-
+-  # The name of the directory it is making an image out of matters to
+-  # mkyaffs2image.  It wants "system" but we have a directory named
+-  # "SYSTEM", so create a symlink.
+-  try:
+-    os.symlink(os.path.join(input_dir, what.upper()),
+-               os.path.join(input_dir, what))
+-  except OSError, e:
+-      # bogus error on my mac version?
+-      #   File "./build/tools/releasetools/img_from_target_files", line 86, in AddSystem
+-      #     os.path.join(OPTIONS.input_tmp, "system"))
+-      # OSError: [Errno 17] File exists
+-    if (e.errno == errno.EEXIST):
+-      pass
+-
+-  image_props = build_image.ImagePropFromGlobalDict(info_dict, what)
+-  fstab = info_dict["fstab"]
+-  if fstab:
+-    image_props["fs_type" ] = fstab["/" + what].fs_type
+-
+-  if what == "system":
+-    fs_config_prefix = ""
+-  else:
+-    fs_config_prefix = what + "_"
+-
+-  fs_config = os.path.join(
+-      input_dir, "META/" + fs_config_prefix + "filesystem_config.txt")
+-  if not os.path.exists(fs_config): fs_config = None
+-
+-  fc_config = os.path.join(input_dir, "BOOT/RAMDISK/file_contexts")
+-  if not os.path.exists(fc_config): fc_config = None
+-
+-  succ = build_image.BuildImage(os.path.join(input_dir, what),
+-                                image_props, img.name,
+-                                fs_config=fs_config,
+-                                fc_config=fc_config)
+-  assert succ, "build " + what + ".img image failed"
+-
+-  mapdata = None
+-
+-  if sparse:
+-    data = open(img.name).read()
+-    img.close()
+-  else:
+-    success, name = build_image.UnsparseImage(img.name, replace=False)
+-    if not success:
+-      assert False, "unsparsing " + what + ".img failed"
+-
+-    if map_file:
+-      mmap = tempfile.NamedTemporaryFile()
+-      mimg = tempfile.NamedTemporaryFile(delete=False)
+-      success = build_image.MappedUnsparseImage(
+-          img.name, name, mmap.name, mimg.name)
+-      if not success:
+-        assert False, "creating sparse map failed"
+-      os.unlink(name)
+-      name = mimg.name
+-
+-      with open(mmap.name) as f:
+-        mapdata = f.read()
+-
+-    try:
+-      with open(name) as f:
+-        data = f.read()
+-    finally:
+-      os.unlink(name)
+-
+-  if mapdata is None:
+-    return data
+-  else:
+-    return mapdata, data
+-
+-
+-def AddUserdata(output_zip):
+-  """Create an empty userdata image and store it in output_zip."""
+-
+-  image_props = build_image.ImagePropFromGlobalDict(OPTIONS.info_dict,
+-                                                    "data")
+-  # We only allow yaffs to have a 0/missing partition_size.
+-  # Extfs, f2fs must have a size. Skip userdata.img if no size.
+-  if (not image_props.get("fs_type", "").startswith("yaffs") and
+-      not image_props.get("partition_size")):
+-    return
+-
+-  print "creating userdata.img..."
+-
+-  # The name of the directory it is making an image out of matters to
+-  # mkyaffs2image.  So we create a temp dir, and within it we create an
+-  # empty dir named "data", and build the image from that.
+-  temp_dir = tempfile.mkdtemp()
+-  user_dir = os.path.join(temp_dir, "data")
+-  os.mkdir(user_dir)
+-  img = tempfile.NamedTemporaryFile()
+-
+-  fstab = OPTIONS.info_dict["fstab"]
+-  if fstab:
+-    image_props["fs_type" ] = fstab["/data"].fs_type
+-  succ = build_image.BuildImage(user_dir, image_props, img.name)
+-  assert succ, "build userdata.img image failed"
+-
+-  common.CheckSize(img.name, "userdata.img", OPTIONS.info_dict)
+-  output_zip.write(img.name, "userdata.img")
+-  img.close()
+-  os.rmdir(user_dir)
+-  os.rmdir(temp_dir)
+-
+-
+-def AddCache(output_zip):
+-  """Create an empty cache image and store it in output_zip."""
+-
+-  image_props = build_image.ImagePropFromGlobalDict(OPTIONS.info_dict,
+-                                                    "cache")
+-  # The build system has to explicitly request for cache.img.
+-  if "fs_type" not in image_props:
+-    return
+-
+-  print "creating cache.img..."
+-
+-  # The name of the directory it is making an image out of matters to
+-  # mkyaffs2image.  So we create a temp dir, and within it we create an
+-  # empty dir named "cache", and build the image from that.
+-  temp_dir = tempfile.mkdtemp()
+-  user_dir = os.path.join(temp_dir, "cache")
+-  os.mkdir(user_dir)
+-  img = tempfile.NamedTemporaryFile()
+-
+-  fstab = OPTIONS.info_dict["fstab"]
+-  if fstab:
+-    image_props["fs_type" ] = fstab["/cache"].fs_type
+-  succ = build_image.BuildImage(user_dir, image_props, img.name)
+-  assert succ, "build cache.img image failed"
+-
+-  common.CheckSize(img.name, "cache.img", OPTIONS.info_dict)
+-  output_zip.write(img.name, "cache.img")
+-  img.close()
+-  os.rmdir(user_dir)
+-  os.rmdir(temp_dir)
+-
+-
+ def CopyInfo(output_zip):
+   """Copy the android-info.txt file from the input to the output."""
+   output_zip.write(os.path.join(OPTIONS.input_tmp, "OTA", "android-info.txt"),
+@@ -225,8 +59,6 @@ def main(argv):
+   bootable_only = [False]
+ 
+   def option_handler(o, a):
+-    if o in ("-b", "--board_config"):
+-      pass       # deprecated
+     if o in ("-z", "--bootable_zip"):
+       bootable_only[0] = True
+     else:
+@@ -234,9 +66,8 @@ def main(argv):
+     return True
+ 
+   args = common.ParseOptions(argv, __doc__,
+-                             extra_opts="b:z",
+-                             extra_long_opts=["board_config=",
+-                                              "bootable_zip"],
++                             extra_opts="z",
++                             extra_long_opts=["bootable_zip"],
+                              extra_option_handler=option_handler)
+ 
+   bootable_only = bootable_only[0]
+@@ -246,48 +77,69 @@ def main(argv):
+     sys.exit(1)
+ 
+   OPTIONS.input_tmp, input_zip = common.UnzipTemp(args[0])
+-  OPTIONS.info_dict = common.LoadInfoDict(input_zip)
+-
+-  # If this image was originally labelled with SELinux contexts, make sure we
+-  # also apply the labels in our new image. During building, the "file_contexts"
+-  # is in the out/ directory tree, but for repacking from target-files.zip it's
+-  # in the root directory of the ramdisk.
+-  if "selinux_fc" in OPTIONS.info_dict:
+-    OPTIONS.info_dict["selinux_fc"] = os.path.join(OPTIONS.input_tmp, "BOOT", "RAMDISK",
+-        "file_contexts")
+-
+   output_zip = zipfile.ZipFile(args[1], "w", compression=zipfile.ZIP_DEFLATED)
++  CopyInfo(output_zip)
+ 
+-  boot_image = common.GetBootableImage(
+-      "boot.img", "boot.img", OPTIONS.input_tmp, "BOOT")
+-  if boot_image:
+-      boot_image.AddToZip(output_zip)
+-  recovery_image = common.GetBootableImage(
+-      "recovery.img", "recovery.img", OPTIONS.input_tmp, "RECOVERY")
+-  if recovery_image:
+-    recovery_image.AddToZip(output_zip)
+-
+-  def banner(s):
+-    print "\n\n++++ " + s + " ++++\n\n"
+-
+-  if not bootable_only:
+-    banner("AddSystem")
+-    AddSystem(output_zip)
+-    try:
+-      input_zip.getinfo("VENDOR/")
+-      banner("AddVendor")
+-      AddVendor(output_zip)
+-    except KeyError:
+-      pass   # no vendor partition for this device
+-    banner("AddUserdata")
+-    AddUserdata(output_zip)
+-    banner("AddCache")
+-    AddCache(output_zip)
+-    CopyInfo(output_zip)
+-
+-  print "cleaning up..."
+-  output_zip.close()
+-  shutil.rmtree(OPTIONS.input_tmp)
++  try:
++    done = False
++    images_path = os.path.join(OPTIONS.input_tmp, "IMAGES")
++    if os.path.exists(images_path):
++      # If this is a new target-files, it already contains the images,
++      # and all we have to do is copy them to the output zip.
++      images = os.listdir(images_path)
++      if images:
++        for i in images:
++          if bootable_only and i not in ("boot.img", "recovery.img"): continue
++          with open(os.path.join(images_path, i), "r") as f:
++            common.ZipWriteStr(output_zip, i, f.read())
++        done = True
++
++    if not done:
++      # We have an old target-files that doesn't already contain the
++      # images, so build them.
++      import add_img_to_target_files
++
++      OPTIONS.info_dict = common.LoadInfoDict(input_zip)
++
++      # If this image was originally labelled with SELinux contexts,
++      # make sure we also apply the labels in our new image. During
++      # building, the "file_contexts" is in the out/ directory tree,
++      # but for repacking from target-files.zip it's in the root
++      # directory of the ramdisk.
++      if "selinux_fc" in OPTIONS.info_dict:
++        OPTIONS.info_dict["selinux_fc"] = os.path.join(
++            OPTIONS.input_tmp, "BOOT", "RAMDISK", "file_contexts")
++
++      boot_image = common.GetBootableImage(
++          "boot.img", "boot.img", OPTIONS.input_tmp, "BOOT")
++      if boot_image:
++          boot_image.AddToZip(output_zip)
++      recovery_image = common.GetBootableImage(
++          "recovery.img", "recovery.img", OPTIONS.input_tmp, "RECOVERY")
++      if recovery_image:
++        recovery_image.AddToZip(output_zip)
++
++      def banner(s):
++        print "\n\n++++ " + s + " ++++\n\n"
++
++      if not bootable_only:
++        banner("AddSystem")
++        add_img_to_target_files.AddSystem(output_zip, prefix="")
++        try:
++          input_zip.getinfo("VENDOR/")
++          banner("AddVendor")
++          add_img_to_target_files.AddVendor(output_zip, prefix="")
++        except KeyError:
++          pass   # no vendor partition for this device
++        banner("AddUserdata")
++        add_img_to_target_files.AddUserdata(output_zip, prefix="")
++        banner("AddCache")
++        add_img_to_target_files.AddCache(output_zip, prefix="")
++
++  finally:
++    print "cleaning up..."
++    output_zip.close()
++    shutil.rmtree(OPTIONS.input_tmp)
+ 
+   print "done."
+ 
+diff --git a/tools/releasetools/ota_from_target_files b/tools/releasetools/ota_from_target_files
+index 5f2354c29..54d488445 100755
+--- a/tools/releasetools/ota_from_target_files
++++ b/tools/releasetools/ota_from_target_files
+@@ -98,7 +98,6 @@ except ImportError:
+   from sha import sha as sha1
+ 
+ import common
+-import img_from_target_files
+ import edify_generator
+ import build_image
+ 
+@@ -418,6 +417,63 @@ def CalculateFingerprint(oem_props, oem_dict, info_dict):
+     GetOemProperty("ro.product.device", oem_props, oem_dict, info_dict),
+     GetBuildProp("ro.build.thumbprint", info_dict))
+ 
++def GetImage(which, tmpdir, info_dict):
++  # Return (mapdata, data) for the given image.  which should be
++  # "system" or "vendor".
++
++  assert which in ("system", "vendor")
++
++  path = os.path.join(tmpdir, "IMAGES", which + ".img")
++  if os.path.exists(path):
++    print "using %s.img from target-files" % (which,)
++
++    # This is a 'new' target-files, which already has the image in it.
++    # The image is a sparse image, though, so we need to unsparse it
++    # and extract the map data.
++
++    success, name = build_image.UnsparseImage(path, replace=False)
++    if not success:
++      assert False, "unsparsing " + which + ".img failed"
++
++    mmap = tempfile.NamedTemporaryFile()
++    mimg = tempfile.NamedTemporaryFile(delete=False)
++    success = build_image.MappedUnsparseImage(
++        path, name, mmap.name, mimg.name)
++    if not success:
++      assert False, "creating sparse map failed"
++    os.unlink(name)
++    name = mimg.name
++
++    with open(mmap.name) as f:
++      mapdata = f.read()
++
++    try:
++      with open(name) as f:
++        data = f.read()
++    finally:
++      os.unlink(name)
++
++    print "unsparsed data sha1 is " + sha1(data).hexdigest()
++    return mapdata, data
++
++  else:
++    print "building %s.img from target-files" % (which,)
++
++    # This is an 'old' target-files, which does not contain images
++    # already built.  Build them.
++
++    import add_img_to_target_files
++    if which == "system":
++      mapdata, data = add_img_to_target_files.BuildSystem(
++          tmpdir, info_dict, sparse=False, map_file=True)
++    elif which == "vendor":
++      mapdata, data = add_img_to_target_files.BuildVendor(
++          tmpdir, info_dict, sparse=False, map_file=True)
++
++    print "built data sha1 is " + sha1(data).hexdigest()
++    return mapdata, data
++
++
+ def WriteFullOTAPackage(input_zip, output_zip):
+   # TODO: how to determine this?  We don't know what version it will
+   # be installed on top of.  For now, we expect the API just won't
+@@ -514,9 +570,7 @@ else if get_stage("%(bcb_dev)s", "stage") == "3/3" then
+   system_items = ItemSet("system", "META/filesystem_config.txt")
+   script.ShowProgress(system_progress, 0)
+   if block_based:
+-    mapdata, data = img_from_target_files.BuildSystem(
+-        OPTIONS.input_tmp, OPTIONS.info_dict,
+-        sparse=False, map_file=True)
++    mapdata, data = GetImage("system", OPTIONS.input_tmp, OPTIONS.info_dict)
+ 
+     common.ZipWriteStr(output_zip, "system.map", mapdata)
+     common.ZipWriteStr(output_zip, "system.muimg", data)
+@@ -551,9 +605,7 @@ else if get_stage("%(bcb_dev)s", "stage") == "3/3" then
+     script.ShowProgress(0.1, 0)
+ 
+     if block_based:
+-      mapdata, data = img_from_target_files.BuildVendor(
+-          OPTIONS.input_tmp, OPTIONS.info_dict,
+-          sparse=False, map_file=True)
++      mapdata, data = GetImage("vendor", OPTIONS.input_tmp, OPTIONS.info_dict)
+ 
+       common.ZipWriteStr(output_zip, "vendor.map", mapdata)
+       common.ZipWriteStr(output_zip, "vendor.muimg", data)
+@@ -647,14 +699,14 @@ def AddToKnownPaths(filename, known_paths):
+     dirs.pop()
+ 
+ class BlockDifference:
+-  def __init__(self, partition, builder, output_zip):
++  def __init__(self, partition, output_zip):
+     with tempfile.NamedTemporaryFile() as src_file:
+       with tempfile.NamedTemporaryFile() as tgt_file:
+         print "building source " + partition + " image..."
+         src_file = tempfile.NamedTemporaryFile()
+-        src_mapdata, src_data = builder(OPTIONS.source_tmp,
+-                                        OPTIONS.source_info_dict,
+-                                        sparse=False, map_file=True)
++        src_mapdata, src_data = GetImage(partition,
++                                         OPTIONS.source_tmp,
++                                         OPTIONS.source_info_dict)
+ 
+         self.src_sha1 = sha1(src_data).hexdigest()
+         print "source " + partition + " sha1:", self.src_sha1
+@@ -662,9 +714,9 @@ class BlockDifference:
+ 
+         print "building target " + partition + " image..."
+         tgt_file = tempfile.NamedTemporaryFile()
+-        tgt_mapdata, tgt_data = builder(OPTIONS.target_tmp,
+-                                        OPTIONS.target_info_dict,
+-                                        sparse=False, map_file=True)
++        tgt_mapdata, tgt_data = GetImage(partition,
++                                         OPTIONS.target_tmp,
++                                         OPTIONS.target_info_dict)
+         self.tgt_sha1 = sha1(tgt_data).hexdigest()
+         print "target " + partition + " sha1:", self.tgt_sha1
+         tgt_len = len(tgt_data)
+@@ -731,13 +783,11 @@ def WriteBlockIncrementalOTAPackage(target_zip, source_zip, output_zip):
+       "/tmp/recovery.img", "recovery.img", OPTIONS.target_tmp, "RECOVERY")
+   updating_recovery = (source_recovery.data != target_recovery.data)
+ 
+-  system_diff = BlockDifference("system", img_from_target_files.BuildSystem,
+-                                output_zip)
++  system_diff = BlockDifference("system", output_zip)
+   if HasVendorPartition(target_zip):
+     if not HasVendorPartition(source_zip):
+       raise RuntimeError("can't generate incremental that adds /vendor")
+-    vendor_diff = BlockDifference("vendor", img_from_target_files.BuildVendor,
+-                                  output_zip)
++    vendor_diff = BlockDifference("vendor", output_zip)
+ 
+   oem_props = OPTIONS.target_info_dict.get("oem_fingerprint_properties")
+   oem_dict = None
+diff --git a/tools/releasetools/sign_target_files_apks b/tools/releasetools/sign_target_files_apks
+index 0ecb906f1..cba0668a7 100755
+--- a/tools/releasetools/sign_target_files_apks
++++ b/tools/releasetools/sign_target_files_apks
+@@ -82,6 +82,7 @@ import subprocess
+ import tempfile
+ import zipfile
+ 
++import add_img_to_target_files
+ import common
+ 
+ OPTIONS = common.OPTIONS
+@@ -166,6 +167,8 @@ def ProcessTargetFiles(input_tf_zip, output_tf_zip, misc_info,
+           f.write(data)
+ 
+   for info in input_tf_zip.infolist():
++    if info.filename.startswith("IMAGES/"): continue
++
+     data = input_tf_zip.read(info.filename)
+     out_info = copy.copy(info)
+ 
+@@ -448,6 +451,8 @@ def main(argv):
+   input_zip.close()
+   output_zip.close()
+ 
++  add_img_to_target_files.AddImagesToTargetFiles(args[1])
++
+   print "done."
+ 
+ 

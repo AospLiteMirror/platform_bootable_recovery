@@ -1,0 +1,122 @@
+From 23ac4042128e47f6fe1ef176e7cb96f907d8e149 Mon Sep 17 00:00:00 2001
+From: Tao Bao <tbao@google.com>
+Date: Thu, 21 May 2015 14:09:49 -0700
+Subject: Assert the stash size when generating OTAs.
+
+With block-based OTA v2 and v3, it requires stash space on the /cache
+partition to back up blocks during an update. We need to ensure that
+it doesn't exceed the partition size. Since there might be other files
+on /cache as well, we use cache_size * threshold as the maximum allowed
+size. The threshold defaults to 0.8, which can be overridden by command
+line option '--stash_threshold'.
+
+Change-Id: I1cce54b82280f803d626a69a087f706343d94bc7
+
+diff --git a/tools/releasetools/blockimgdiff.py b/tools/releasetools/blockimgdiff.py
+index 6ed9ca2e3..a007f812f 100644
+--- a/tools/releasetools/blockimgdiff.py
++++ b/tools/releasetools/blockimgdiff.py
+@@ -16,6 +16,7 @@ from __future__ import print_function
+ 
+ from collections import deque, OrderedDict
+ from hashlib import sha1
++import common
+ import heapq
+ import itertools
+ import multiprocessing
+@@ -460,9 +461,20 @@ class BlockImageDiff(object):
+       if free_string:
+         out.append("".join(free_string))
+ 
+-      # sanity check: abort if we're going to need more than 512 MB if
+-      # stash space
+-      assert max_stashed_blocks * self.tgt.blocksize < (512 << 20)
++      if self.version >= 2:
++        # Sanity check: abort if we're going to need more stash space than
++        # the allowed size (cache_size * threshold). There are two purposes
++        # of having a threshold here. a) Part of the cache may have been
++        # occupied by some recovery logs. b) It will buy us some time to deal
++        # with the oversize issue.
++        cache_size = common.OPTIONS.cache_size
++        stash_threshold = common.OPTIONS.stash_threshold
++        max_allowed = cache_size * stash_threshold
++        assert max_stashed_blocks * self.tgt.blocksize < max_allowed, \
++               'Stash size %d (%d * %d) exceeds the limit %d (%d * %.2f)' % (
++                   max_stashed_blocks * self.tgt.blocksize, max_stashed_blocks,
++                   self.tgt.blocksize, max_allowed, cache_size,
++                   stash_threshold)
+ 
+     # Zero out extended blocks as a workaround for bug 20881595.
+     if self.tgt.extended:
+@@ -489,8 +501,11 @@ class BlockImageDiff(object):
+         f.write(i)
+ 
+     if self.version >= 2:
+-      print("max stashed blocks: %d  (%d bytes)\n" % (
+-          max_stashed_blocks, max_stashed_blocks * self.tgt.blocksize))
++      max_stashed_size = max_stashed_blocks * self.tgt.blocksize
++      max_allowed = common.OPTIONS.cache_size * common.OPTIONS.stash_threshold
++      print("max stashed blocks: %d  (%d bytes), limit: %d bytes (%.2f%%)\n" % (
++          max_stashed_blocks, max_stashed_size, max_allowed,
++          max_stashed_size * 100.0 / max_allowed))
+ 
+   def ComputePatches(self, prefix):
+     print("Reticulating splines...")
+diff --git a/tools/releasetools/ota_from_target_files.py b/tools/releasetools/ota_from_target_files.py
+index 8fe4864e4..531b43220 100755
+--- a/tools/releasetools/ota_from_target_files.py
++++ b/tools/releasetools/ota_from_target_files.py
+@@ -84,6 +84,9 @@ Usage:  ota_from_target_files [flags] input_target_files output_ota_package
+       Specifies the number of worker-threads that will be used when
+       generating patches for incremental updates (defaults to 3).
+ 
++  --stash_threshold <float>
++      Specifies the threshold that will be used to compute the maximum
++      allowed stash size (defaults to 0.8).
+ """
+ 
+ import sys
+@@ -122,6 +125,10 @@ OPTIONS.updater_binary = None
+ OPTIONS.oem_source = None
+ OPTIONS.fallback_to_full = True
+ OPTIONS.full_radio = False
++# Stash size cannot exceed cache_size * threshold.
++OPTIONS.cache_size = None
++OPTIONS.stash_threshold = 0.8
++
+ 
+ def MostPopularKey(d, default):
+   """Given a dict, return the key corresponding to the largest
+@@ -1504,6 +1511,12 @@ def main(argv):
+       OPTIONS.updater_binary = a
+     elif o in ("--no_fallback_to_full",):
+       OPTIONS.fallback_to_full = False
++    elif o == "--stash_threshold":
++      try:
++        OPTIONS.stash_threshold = float(a)
++      except ValueError:
++        raise ValueError("Cannot parse value %r for option %r - expecting "
++                         "a float" % (a, o))
+     else:
+       return False
+     return True
+@@ -1527,6 +1540,7 @@ def main(argv):
+                                  "oem_settings=",
+                                  "verify",
+                                  "no_fallback_to_full",
++                                 "stash_threshold=",
+                              ], extra_option_handler=option_handler)
+ 
+   if len(args) != 2:
+@@ -1576,6 +1590,11 @@ def main(argv):
+       output_zip = zipfile.ZipFile(temp_zip_file, "w",
+                                    compression=zipfile.ZIP_DEFLATED)
+ 
++    cache_size = OPTIONS.info_dict.get("cache_size", None)
++    if cache_size is None:
++      raise RuntimeError("can't determine the cache partition size")
++    OPTIONS.cache_size = cache_size
++
+     if OPTIONS.incremental_source is None:
+       WriteFullOTAPackage(input_zip, output_zip)
+       if OPTIONS.package_key is None:

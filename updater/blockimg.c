@@ -71,7 +71,7 @@ static RangeSet* parse_range(char* text) {
 
     RangeSet* out = malloc(sizeof(RangeSet) + num * sizeof(int));
     if (out == NULL) {
-        fprintf(stderr, "failed to allocate range of %lu bytes\n",
+        fprintf(stderr, "failed to allocate range of %zu bytes\n",
                 sizeof(RangeSet) + num * sizeof(int));
         exit(1);
     }
@@ -362,6 +362,187 @@ static void* unzip_new_data(void* cookie) {
     return NULL;
 }
 
+// Do a source/target load for move/bsdiff/imgdiff in version 1.
+// 'wordsave' is the save_ptr of a strtok_r()-in-progress.  We expect
+// to parse the remainder of the string as:
+//
+//    <src_range> <tgt_range>
+//
+// The source range is loaded into the provided buffer, reallocating
+// it to make it larger if necessary.  The target ranges are returned
+// in *tgt, if tgt is non-NULL.
+
+// V2中stash命令调用为LoadSrcTgtVersion1(wordsave, NULL, &src_blocks,	stash_table + stash_id, &stash_alloc, fd);
+// 对于stash命令,1 解析按src RangeSet命令后面就没有tgt RangeSet,因此调用时tgt必须传NULL
+// 2 V1的move等将src RangeSet范围的block加载到申请的buffer中,
+// 而V2的stash等将src RangeSet范围的block加载到之前申请的stash table指向的内存中
+static void LoadSrcTgtVersion1(char* wordsave, RangeSet** tgt, int* src_blocks,
+                               uint8_t** buffer, size_t* buffer_alloc, int fd) {
+    char* word;
+
+    word = strtok_r(NULL, " ", &wordsave);
+    //将2,545836,545840 解析为src的range
+    RangeSet* src = parse_range(word);
+
+    if (tgt != NULL) {
+        word = strtok_r(NULL, " ", &wordsave);
+        //将2,545500,545504 解析为tgt的range
+        *tgt = parse_range(word);
+    }
+
+    // 按src range的block个数(src->size)申请内存, buffer指向申请到的内存首地址,申请成功块个数传给buffer_alloc,正常情况下*buffer_alloc = size
+    // 在allocate中会比较size和buffer_alloc,根据buffer_alloc含义,如果>size,就可以重用buffer,allocate可以直接返回
+    // buffer_alloc保存实际分配成功的内存大小
+    // 对于stash命令在保存 加载stash 的buffer,也是在这里完成分配
+    allocate(src->size * BLOCKSIZE, buffer, buffer_alloc);
+    size_t p = 0;
+    int i;
+    // 在这个for中把src rangeset表示的所有block区间的数据读到buffer指向的内存中
+    for (i = 0; i < src->count; ++i) {
+        check_lseek(fd, (off64_t)src->pos[i*2] * BLOCKSIZE, SEEK_SET);
+        size_t sz = (src->pos[i*2+1] - src->pos[i*2]) * BLOCKSIZE;
+        //从blockdev_filename->data中取偏移,将读到的内容保存到上面申请的buffer
+        readblock(fd, *buffer+p, sz);
+        p += sz;
+    }
+
+    *src_blocks = src->size;
+    free(src);
+}
+
+// packed 异常拥挤的
+// source含有部分可能会被overwrite的数据,
+static void MoveRange(uint8_t* dest, RangeSet* locs, const uint8_t* source) {
+    // source contains packed data, which we want to move to the
+    // locations given in *locs in the dest buffer.  source and dest
+    // may be the same buffer.
+
+    int start = locs->size;
+    int i;
+    for (i = locs->count-1; i >= 0; --i) {
+        int blocks = locs->pos[i*2+1] - locs->pos[i*2];
+        start -= blocks;
+        // memmove用于从src拷贝count个字节到dest，如果目标区域和源区域有重叠的话，memmove能够保证源串在被覆盖之前将
+        // 但是当目标区域与源区域没有重叠则和memcpy函数功能相同
+        // memcpy和memmove（）都是C语言中的库函数，在头文件string.h中，作用是拷贝一定长度的内存的内容
+        // 他们的作用是一样的，唯一的区别是，当内存发生局部重叠的时候，memmove保证拷贝的结果是正确的，memcpy不保证他们的作用是一样的，唯一的区别是，当内存发生局部重叠的时候，memmove保证拷贝的结果是正确的，memcpy不保证
+        memmove(dest + (locs->pos[i*2] * BLOCKSIZE), source + (start * BLOCKSIZE),
+                blocks * BLOCKSIZE);
+    }
+}
+
+// Do a source/target load for move/bsdiff/imgdiff in version 2.
+// 'wordsave' is the save_ptr of a strtok_r()-in-progress.  We expect
+// to parse the remainder of the string as one of:
+//
+//    <tgt_range> <src_block_count> <src_range>
+//        (loads data from source image only)
+//
+//    <tgt_range> <src_block_count> - <[stash_id:stash_range] ...>
+//        (loads data from stashes only)
+//
+//    <tgt_range> <src_block_count> <src_range> <src_loc> <[stash_id:stash_range] ...>
+//        (loads data from both source image and stashes)
+//
+// On return, buffer is filled with the loaded source data (rearranged
+// and combined with stashed data as necessary).  buffer may be
+// reallocated if needed to accommodate the source data.  *tgt is the
+// target RangeSet.  Any stashes required are taken from stash_table
+// and free()'d after being used.
+
+
+//Generate version 2 of the block_image_update transfer list format.
+//This improves patch size by a different strategy for dealing with
+//out-of-order transfers.  If transfer A must be done before transfer B
+//due to B overwriting A's source but we want to do B before A, we
+//resolve the conflict by:
+//
+//  - before B is executed, we save ("stash") the overlapping region (ie
+//    the blocks B will overwrite that A wants to read)
+//
+//  - when A is executed, it will read those parts of source data from
+//    the stash rather than from the image.
+
+//This reverses the ordering constraint; with these additions now B
+//*must* go before A.  The implementation of the stash is left up to the
+//code that executes the transfer list to apply the patch; it could hold
+//stashed data in RAM or on a scratch disk such as /cache, if available.
+// 这打破了以前的顺序约束,有了这个新增现在B必须在A前面执行
+// stash的实现放在了 执行transfer list中命令来打patch 的代码中
+
+static void LoadSrcTgtVersion2(char* wordsave, RangeSet** tgt, int* src_blocks,
+                               uint8_t** buffer, size_t* buffer_alloc, int fd,
+                               uint8_t** stash_table) {
+    char* word;
+
+    // 解析tgt的range
+    if (tgt != NULL) {
+        word = strtok_r(NULL, " ", &wordsave);
+        *tgt = parse_range(word);
+    }
+
+    word = strtok_r(NULL, " ", &wordsave);
+    // 解析src_block_count,传给src_blocks
+    *src_blocks = strtol(word, NULL, 0);
+
+    // 先从内存中申请buffer
+    allocate(*src_blocks * BLOCKSIZE, buffer, buffer_alloc);
+
+    word = strtok_r(NULL, " ", &wordsave);
+    if (word[0] == '-' && word[1] == '\0') {
+        //  如果src_block_count后有'-', 则'-'后是<[stash_id:stash_range] ...>
+        // no source ranges, only stashes
+    } else {
+        // 如果src_block_count后没有'-', 那么其后面至少有<src_range>,要么是<src_range>,要么是<src_range> <src_loc> <[stash_id:stash_range] ...>
+        // 因此先解析src_range
+        RangeSet* src = parse_range(word);
+
+        size_t p = 0;
+        int i;
+        // for中读取src_range到buffer
+        for (i = 0; i < src->count; ++i) {
+            check_lseek(fd, (off64_t)src->pos[i*2] * BLOCKSIZE, SEEK_SET);
+            size_t sz = (src->pos[i*2+1] - src->pos[i*2]) * BLOCKSIZE;
+            readblock(fd, *buffer+p, sz);
+            p += sz;
+        }
+        free(src);
+
+        word = strtok_r(NULL, " ", &wordsave);
+        if (word == NULL) {
+            // 如果src_block_count后只有<src_range>, 因为已经读取src_range到buffer,因此到这里没有什么要做的了
+            // 这时函数直接返回.这种情况参数跟V1基本一样,因此函数逻辑跟LoadSrcTgtVersion1很相似,要做的也基本一样
+            // no stashes, only source range
+            return;
+        }
+
+        // 继续解析<src_loc>
+        RangeSet* locs = parse_range(word);
+        // 因为上面buffer中加载加载的全是source range,       调用MoveRange将source部分重叠区域的数据也移到buffer中对应同样位置中
+        MoveRange(*buffer, locs, *buffer);
+    }
+
+    // 在while循环中解析<src_loc>后面的 <[stash_id:stash_range] ...>
+    while ((word = strtok_r(NULL, " ", &wordsave)) != NULL) {
+        // Each word is a an index into the stash table, a colon, and
+        // then a rangeset describing where in the source block that
+        // stashed data should go.
+        char* colonsave = NULL;
+        char* colon = strtok_r(word, ":", &colonsave);
+        // stash_id: an index into the stash table
+        int stash_id = strtol(colon, NULL, 0);
+        colon = strtok_r(NULL, ":", &colonsave);
+        // a rangeset describing where in the source block that stashed data should go
+        // 解析出来的位置locs,stashed data最近一次执行stash命令从source lock加载时在source中的位置
+        RangeSet* locs = parse_range(colon);
+        // 将这个stash_id指向的stashed的数据加载到buffer中locs位置
+        MoveRange(*buffer, locs, stash_table[stash_id]);
+        free(stash_table[stash_id]);
+        stash_table[stash_id] = NULL;
+        free(locs);
+    }
+}
+
 //block_image_update("/dev/block/bootdevice/by-name/system", package_extract_file("system.transfer.list"), "system.new.dat", "system.patch.dat");
 // args:
 //    - block device (or file) to modify in-place
@@ -446,23 +627,44 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
     //    new [rangeset]
     //      - fill the blocks with data read from the new_data file
     //
-    //    bsdiff patchstart patchlen [src rangeset] [tgt rangeset]
-    //    imgdiff patchstart patchlen [src rangeset] [tgt rangeset]
-    //      - read the source blocks, apply a patch, write result to
-    //        target blocks.  bsdiff or imgdiff specifies the type of
-    //        patch.
-    //
-    //    move [src rangeset] [tgt rangeset]
-    //      - copy data from source blocks to target blocks (no patch
-    //        needed; rangesets are the same size)
-    //
     //    erase [rangeset]
     //      - mark the given blocks as empty
     //
+    //    move <...>
+	//    bsdiff <patchstart> <patchlen> <...>
+	//    imgdiff <patchstart> <patchlen> <...>
+	// 	    - read the source blocks, apply a patch (or not in the
+	// 	      case of move), write result to target blocks.  bsdiff or
+	// 	      imgdiff specifies the type of patch; move means no patch
+	// 	      at all.
+	//
+	// 	      The format of <...> differs between versions 1 and 2;
+	// 	      see the LoadSrcTgtVersion{1,2}() functions for a
+	// 	      description of what's expected.
+	//
+	//    stash <stash_id> <src_range>
+	// 	    - (version 2 only) load the given source range and stash
+	// 	      the data in the given slot of the stash table.
+	//      V2新增,the given slot of the stash table就是stash_id
+	//
     // The creator of the transfer list will guarantee that no block
     // is read (ie, used as the source for a patch or move) after it
     // has been written.
     //
+	// In version 2, the creator will guarantee that a given stash is
+    // loaded (with a stash command) before it's used in a
+	// move/bsdiff/imgdiff command.
+	// 创建transfer list时会保证 一个stash在stash命令中的加载 会放在被move/bsdiff/imgdiff命令使用此stash之前
+	// 
+	
+// v2中,支持一个新命令stash, stash将从source img中读取的数据,保存到
+// 分配的内存"stash table", 随后会 用stash table中刚存储的项去填充
+// source data中丢失的字节位,因为这些字节位在执行move/bsdiff/imgdiff
+// 时是不允许去读的
+// 这会产生更小的升级包,因为我们可以通过把数据存储到别处然后以后使用的方式, 
+// 来到达 按pieces是怎么更新的顺序 来组织
+// 而不是一点都不使用 作为输入的数据来对系统打patch
+	//
     // Within one command the source and target ranges may overlap so
     // in general we need to read the entire source into memory before
     // writing anything to the target blocks.
@@ -548,15 +750,22 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
     // 读取transfer.list文件的第1行
     line = strtok_r(transfer_list, "\n", &linesave);
 
+    // version保存transfer.list文件第一行版本号
+    int version;
     // first line in transfer list is the version number; currently
     // there's only version 1.
 	// recovery 5.0 lollipop-erlease对应的api是1
-	// d83e4f15890ac6ebe0d61924bd224eb1ae8565ad support for version 2 of block image diffs Change-Id: I4559bfd76d5403859637aeac832f3a5e9e13b63a 开始新增V2
 	// 90221205a3e58f2a198faa838088dc7bc7c9c752 Support resuming block based OTAs Change-Id: I1e752464134aeb2d396946348e6041acabe13942 开始新增V3
-    if (strcmp(line, "1") != 0) {
+	if (strcmp(line, "1") == 0) {
+		version = 1;
+	// d83e4f15890ac6ebe0d61924bd224eb1ae8565ad support for version 2 of block image diffs Change-Id: I4559bfd76d5403859637aeac832f3a5e9e13b63a 开始新增V2
+	} else if (strcmp(line, "2") == 0) {
+		version = 2;
+	} else {
         ErrorAbort(state, "unexpected transfer list version [%s]\n", line);
         goto done;
     }
+    printf("blockimg version is %d\n", version);
 
     // second line in transfer list is the total number of blocks we
     // expect to write.
@@ -568,6 +777,29 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
     // blocks_so_far含义为目前已经写入的blocks数目,最大值是total_blocks
     int blocks_so_far = 0;
 
+	uint8_t** stash_table = NULL;
+	if (version >= 2) {
+		// Next line is how many stash entries are needed simultaneously.
+		// transfer.list从V2开始,第3行为同时并存的stash文件数
+		line = strtok_r(NULL, "\n", &linesave);
+		int stash_entries = strtol(line, NULL, 0);
+
+        //在内存的动态存储区中分配n个长度为size的连续空间 calloc在动态分配完内存后，自动初始化该内存空间为零，而malloc不初始化，里边数据是随机的垃圾数据
+		stash_table = (uint8_t**) calloc(stash_entries, sizeof(uint8_t*));
+		if (stash_table == NULL) {
+			fprintf(stderr, "failed to allocate %d-entry stash table\n", stash_entries);
+			exit(1);
+		}
+
+		// Next line is the maximum number of blocks that will be
+		// stashed simultaneously.  This could be used to verify that
+		// enough memory or scratch disk space is available.
+		// transfer.list从V2开始,第4行为最大stash文件所占用的block空间数
+		// stash_max_blocks可用于检测是否有足够多可用的内存或零散磁盘空间
+		line = strtok_r(NULL, "\n", &linesave);
+		int stash_max_blocks = strtol(line, NULL, 0);
+	 }
+
     uint8_t* buffer = NULL;
     // buffer_alloc为已经分配的内存大小
     size_t buffer_alloc = 0;
@@ -576,6 +808,7 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
 	// 在这个for循环中依次读取每行命令
     for (line = strtok_r(NULL, "\n", &linesave); line;
          line = strtok_r(NULL, "\n", &linesave)) {
+
 		// style代表每行前的命令名称，如move，bsdiff等	
         char* style;
         style = strtok_r(line, " ", &wordsave);
@@ -586,28 +819,21 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
         // sha256--64 sha512--128
 		//处理system.transfer.list中的move命令 
         if (strcmp("move", style) == 0) {
-            word = strtok_r(NULL, " ", &wordsave);
-			//将2,545836,545840 解析为src的range
-            RangeSet* src = parse_range(word);
-            word = strtok_r(NULL, " ", &wordsave);
-			//将2,545500,545504 解析为tgt的range
-            RangeSet* tgt = parse_range(word);
+	        RangeSet* tgt;
+			int src_blocks;
+			// 执行LoadSrcTgtVersion1或LoadSrcTgtVersion2后,tgt就会保存target的block range信息
+			if (version == 1) {
+				LoadSrcTgtVersion1(wordsave, &tgt, &src_blocks,
+								   &buffer, &buffer_alloc, fd);
+			} else if (version == 2) {
+				LoadSrcTgtVersion2(wordsave, &tgt, &src_blocks,
+								   &buffer, &buffer_alloc, fd, stash_table);
+			}
 
-            printf("  moving %d blocks\n", src->size);
 
-			// 按src range的block个数(src->size)申请内存, buffer指向申请到的内存首地址, 申请成功块个数传给buffer_alloc,正常情况下*buffer_alloc = size
-			// 在allocate中会比较size和buffer_alloc,根据buffer_alloc含义,如果>size,就可以重用buffer,allocate可以直接返回
-            allocate(src->size * BLOCKSIZE, &buffer, &buffer_alloc);
+            printf("  moving %d blocks\n", src_blocks);
+
             size_t p = 0;
-            for (i = 0; i < src->count; ++i) {
-                check_lseek(fd, (off64_t)src->pos[i*2] * BLOCKSIZE, SEEK_SET);
-                size_t sz = (src->pos[i*2+1] - src->pos[i*2]) * BLOCKSIZE;
-				//从blockdev_filename->data中取偏移,将读到的内容保存到上面申请的buffer
-                readblock(fd, buffer+p, sz);
-                p += sz;
-            }
-
-            p = 0;
             for (i = 0; i < tgt->count; ++i) {
                 check_lseek(fd, (off64_t)tgt->pos[i*2] * BLOCKSIZE, SEEK_SET);
                 size_t sz = (tgt->pos[i*2+1] - tgt->pos[i*2]) * BLOCKSIZE;
@@ -623,8 +849,26 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
             fprintf(cmd_pipe, "set_progress %.4f\n", (double)blocks_so_far / total_blocks);
             fflush(cmd_pipe);
 
-            free(src);
             free(tgt);
+
+		} else if (strcmp("stash", style) == 0) {
+		    // V2:stash <stash_id> <src_range> (version 2 only) load the given source range and stash the data in the given slot of the stash table.
+            // 每个stash命令的stash_id在后面的bsdiff或imgdiff的<[stash_id:stash_range] ...>部分中一定会再出现,
+            // 这时bsdiff或imgdiff会将每一个解析到的[stash_id:stash_range],从stash table指向的内存中加载到buffer中
+            // V2版只是完全将stash数据加载到内存中,STASH_DIRECTORY_BASE "/cache/recovery"在V3中引入
+		    //stash 379e95f9e04037974674f92db25ce81576d85e64 2,268210,268211
+			word = strtok_r(NULL, " ", &wordsave);
+			int stash_id = strtol(word, NULL, 0);
+			int src_blocks;
+			size_t stash_alloc = 0;
+
+			// Even though the "stash" style only appears in version
+			// 2, the version 1 source loader happens to do exactly
+			// what we want to read data into the stash_table.
+			// stash_table为整个s保存tash表的buffer的起始地址
+			// 因此stash_table+stash_id指向 申请的保存 此stash命令从src range读取的block 的buffer的首地址
+			LoadSrcTgtVersion1(wordsave, NULL, &src_blocks,
+								stash_table + stash_id, &stash_alloc, fd);
 
         } else if (strcmp("zero", style) == 0 ||
         // V1:zero [rangeset] fill the indicated blocks with zeros
@@ -706,41 +950,27 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
         } else if (strcmp("bsdiff", style) == 0 ||
                    strcmp("imgdiff", style) == 0) {
             // V1:bsdiff patchstart patchlen [src rangeset] [tgt rangeset] imgdiff patchstart patchlen [src rangeset] [tgt rangeset] read the source blocks, apply a patch, write result to target blocks.
+            // read the source blocks, apply a patch, write result to target blocks.  bsdiff or imgdiff specifies the type of patch. 
             // bsdiff 0(patch_offset) 35581(patch_len) 67a63498a1293c14e23768bf7200348b8837e949 9c06e7e0277dee8c98e9a8b2a10d8649f6cfb3b0 2,367217,368194 979 2,367217,368196
-// imgdiff 134034 2022 192e81959ac1985b1d90962faae1286029d4f39e 021c103903aa2da3ef222e1da5bdccdee287d1c3 2,40903,41035 132 2,40904,41036
-// bsdiff 0(patch_offset) 35581(patch_len) 2,367217,368194(src_range) 2,367217,368196(tgt_range)
-// imgdiff 134034(patch_offset) 2022(patch_len) 2,40903,41035(src_range) 132 2,40904,41036(tgt_range)
-    //    bsdiff patchstart patchlen [src rangeset] [tgt rangeset]
-    //    imgdiff patchstart patchlen [src rangeset] [tgt rangeset]
-    //      - read the source blocks, apply a patch, write result to
-    //        target blocks.  bsdiff or imgdiff specifies the type of
-    //        patch.
+            // imgdiff 134034 2022 192e81959ac1985b1d90962faae1286029d4f39e 021c103903aa2da3ef222e1da5bdccdee287d1c3 2,40903,41035 132 2,40904,41036
+            // bsdiff 0(patch_offset) 35581(patch_len) 2,367217,368194(src_range) 2,367217,368196(tgt_range)
+            // imgdiff 134034(patch_offset) 2022(patch_len) 2,40903,41035(src_range) 132 2,40904,41036(tgt_range)     
             word = strtok_r(NULL, " ", &wordsave);
-            // 将bsdiff或imgdiff命令后面第1个参数传给patch_offset
             size_t patch_offset = strtoul(word, NULL, 0);
             word = strtok_r(NULL, " ", &wordsave);
-             // 将bsdiff或imgdiff命令后面第2个参数传给patch_offset
             size_t patch_len = strtoul(word, NULL, 0);
 
-            word = strtok_r(NULL, " ", &wordsave);
-            RangeSet* src = parse_range(word);
-            word = strtok_r(NULL, " ", &wordsave);
-            RangeSet* tgt = parse_range(word);
-
-            printf("  patching %d blocks to %d\n", src->size, tgt->size);
-
-            // Read the source into memory.
-            //调用allocate, 分配一段内存buffer,buffer_alloc保存实际分配成功的内存大小
-            allocate(src->size * BLOCKSIZE, &buffer, &buffer_alloc);
-            size_t p = 0;
-            // 在这个for中把src rangeset表示的所有block区间的数据读到buffer指向的内存中
-            for (i = 0; i < src->count; ++i) {
-                check_lseek(fd, (off64_t)src->pos[i*2] * BLOCKSIZE, SEEK_SET);
-                size_t sz = (src->pos[i*2+1] - src->pos[i*2]) * BLOCKSIZE;
-                //从blockdev_filename->data中取偏移,将读到的内容保存到上面申请的buffer
-                readblock(fd, buffer+p, sz);
-                p += sz;
+			RangeSet* tgt;
+			int src_blocks;
+			if (version == 1) {
+				LoadSrcTgtVersion1(wordsave, &tgt, &src_blocks,
+								   &buffer, &buffer_alloc, fd);
+			} else if (version == 2) {
+				LoadSrcTgtVersion2(wordsave, &tgt, &src_blocks,
+								   &buffer, &buffer_alloc, fd, stash_table);
             }
+
+            printf("  patching %d blocks to %d\n", src_blocks, tgt->size);
 
             Value patch_value;
             patch_value.type = VAL_BLOB;
@@ -757,11 +987,11 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
             check_lseek(fd, (off64_t)tgt->pos[0] * BLOCKSIZE, SEEK_SET);
 
             if (style[0] == 'i') {      // imgdiff
-                ApplyImagePatch(buffer, src->size * BLOCKSIZE,
+                ApplyImagePatch(buffer, src_blocks * BLOCKSIZE,
                                 &patch_value,
                                 &RangeSinkWrite, &rss, NULL, NULL);
             } else {
-                ApplyBSDiffPatch(buffer, src->size * BLOCKSIZE,
+                ApplyBSDiffPatch(buffer, src_blocks * BLOCKSIZE,
                                  &patch_value, 0,
                                  &RangeSinkWrite, &rss, NULL);
             }
@@ -777,7 +1007,6 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
             fprintf(cmd_pipe, "set_progress %.4f\n", (double)blocks_so_far / total_blocks);
             fflush(cmd_pipe);
 
-            free(src);
             free(tgt);
         } else if (!DEBUG_ERASE && strcmp("erase", style) == 0) {
             // DEBUG_ERASE:Set this to 0 to interpret 'erase' transfers to mean do a BLKDISCARD ioctl (the normal behavior).

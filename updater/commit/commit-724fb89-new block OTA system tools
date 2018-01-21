@@ -1,0 +1,1771 @@
+From 724fb897fcb1ec783a87ebe5801ae3a2b68edfb5 Mon Sep 17 00:00:00 2001
+From: Elliott Hughes <enh@google.com>
+Date: Thu, 21 Aug 2014 05:30:39 +0000
+Subject: new block OTA system tools
+
+Replace the xdelta/xz-based block OTA generation with a new system
+based on the existing bsdiff/imgdiff tools.
+
+Bug: 16984795
+Change-Id: Ib54d0a0fbcabaddc24db4c133b4e49a34e26e7ec
+
+diff --git a/tools/releasetools/add_img_to_target_files.py b/tools/releasetools/add_img_to_target_files.py
+index 568a3f132..e7ba28d38 100755
+--- a/tools/releasetools/add_img_to_target_files.py
++++ b/tools/releasetools/add_img_to_target_files.py
+@@ -46,44 +46,46 @@ import common
+ OPTIONS = common.OPTIONS
+ 
+ 
+-def AddSystem(output_zip, sparse=True, prefix="IMAGES/"):
++def AddSystem(output_zip, prefix="IMAGES/"):
+   """Turn the contents of SYSTEM into a system image and store it in
+   output_zip."""
+-  block_list = tempfile.NamedTemporaryFile()
+-  data = BuildSystem(OPTIONS.input_tmp, OPTIONS.info_dict, sparse=sparse,
+-                     block_list=block_list.name)
+-  common.ZipWriteStr(output_zip, prefix + "system.img", data)
+-  with open(block_list.name, "rb") as f:
+-    block_list_data = f.read()
+-  common.ZipWriteStr(output_zip, prefix + "system.map", block_list_data)
+-  block_list.close()
+-
+-def BuildSystem(input_dir, info_dict, sparse=True, map_file=None,
+-                block_list=None):
+-  return CreateImage(input_dir, info_dict, "system",
+-                     sparse=sparse, map_file=map_file, block_list=block_list)
+-
+-def AddVendor(output_zip, sparse=True, prefix="IMAGES/"):
+-  block_list = tempfile.NamedTemporaryFile()
+-  data = BuildVendor(OPTIONS.input_tmp, OPTIONS.info_dict, sparse=sparse,
++  block_list = common.MakeTempFile(prefix="system-blocklist-", suffix=".map")
++  imgname = BuildSystem(OPTIONS.input_tmp, OPTIONS.info_dict,
++                        block_list=block_list)
++  with open(imgname, "rb") as f:
++    common.ZipWriteStr(output_zip, prefix + "system.img", f.read())
++  with open(block_list, "rb") as f:
++    common.ZipWriteStr(output_zip, prefix + "system.map", f.read())
++
++
++def BuildSystem(input_dir, info_dict, block_list=None):
++  """Build the (sparse) system image and return the name of a temp
++  file containing it."""
++  return CreateImage(input_dir, info_dict, "system", block_list=block_list)
++
++
++def AddVendor(output_zip, prefix="IMAGES/"):
++  """Turn the contents of VENDOR into a vendor image and store in it
++  output_zip."""
++  block_list = common.MakeTempFile(prefix="vendor-blocklist-", suffix=".map")
++  imgname = BuildVendor(OPTIONS.input_tmp, OPTIONS.info_dict,
+                      block_list=block_list.name)
+-  common.ZipWriteStr(output_zip, prefix + "vendor.img", data)
+-  with open(block_list.name, "rb") as f:
+-    block_list_data = f.read()
+-  common.ZipWriteStr(output_zip, prefix + "vendor.map", block_list_data)
+-  block_list.close()
++  with open(imgname, "rb") as f:
++    common.ZipWriteStr(output_zip, prefix + "vendor.img", f.read())
++  with open(block_list, "rb") as f:
++    common.ZipWriteStr(output_zip, prefix + "vendor.map", f.read())
+ 
+-def BuildVendor(input_dir, info_dict, sparse=True, map_file=None,
+-                block_list=None):
+-  return CreateImage(input_dir, info_dict, "vendor",
+-                     sparse=sparse, map_file=map_file, block_list=block_list)
+ 
++def BuildVendor(input_dir, info_dict, block_list=None):
++  """Build the (sparse) vendor image and return the name of a temp
++  file containing it."""
++  return CreateImage(input_dir, info_dict, "vendor", block_list=block_list)
+ 
+-def CreateImage(input_dir, info_dict, what, sparse=True, map_file=None,
+-                block_list=None):
++
++def CreateImage(input_dir, info_dict, what, block_list=None):
+   print "creating " + what + ".img..."
+ 
+-  img = tempfile.NamedTemporaryFile()
++  img = common.MakeTempFile(prefix=what + "-", suffix=".img")
+ 
+   # The name of the directory it is making an image out of matters to
+   # mkyaffs2image.  It wants "system" but we have a directory named
+@@ -117,45 +119,13 @@ def CreateImage(input_dir, info_dict, what, sparse=True, map_file=None,
+   if not os.path.exists(fc_config): fc_config = None
+ 
+   succ = build_image.BuildImage(os.path.join(input_dir, what),
+-                                image_props, img.name,
++                                image_props, img,
+                                 fs_config=fs_config,
+                                 fc_config=fc_config,
+                                 block_list=block_list)
+   assert succ, "build " + what + ".img image failed"
+ 
+-  mapdata = None
+-
+-  if sparse:
+-    data = open(img.name).read()
+-    img.close()
+-  else:
+-    success, name = build_image.UnsparseImage(img.name, replace=False)
+-    if not success:
+-      assert False, "unsparsing " + what + ".img failed"
+-
+-    if map_file:
+-      mmap = tempfile.NamedTemporaryFile()
+-      mimg = tempfile.NamedTemporaryFile(delete=False)
+-      success = build_image.MappedUnsparseImage(
+-          img.name, name, mmap.name, mimg.name)
+-      if not success:
+-        assert False, "creating sparse map failed"
+-      os.unlink(name)
+-      name = mimg.name
+-
+-      with open(mmap.name) as f:
+-        mapdata = f.read()
+-
+-    try:
+-      with open(name) as f:
+-        data = f.read()
+-    finally:
+-      os.unlink(name)
+-
+-  if mapdata is None:
+-    return data
+-  else:
+-    return mapdata, data
++  return img
+ 
+ 
+ def AddUserdata(output_zip, prefix="IMAGES/"):
+@@ -226,57 +196,53 @@ def AddCache(output_zip, prefix="IMAGES/"):
+ 
+ def AddImagesToTargetFiles(filename):
+   OPTIONS.input_tmp, input_zip = common.UnzipTemp(filename)
+-  try:
+ 
+-    for n in input_zip.namelist():
+-      if n.startswith("IMAGES/"):
+-        print "target_files appears to already contain images."
+-        sys.exit(1)
+-
+-    try:
+-      input_zip.getinfo("VENDOR/")
+-      has_vendor = True
+-    except KeyError:
+-      has_vendor = False
+-
+-    OPTIONS.info_dict = common.LoadInfoDict(input_zip)
+-    if "selinux_fc" in OPTIONS.info_dict:
+-      OPTIONS.info_dict["selinux_fc"] = os.path.join(
+-          OPTIONS.input_tmp, "BOOT", "RAMDISK", "file_contexts")
+-
+-    input_zip.close()
+-    output_zip = zipfile.ZipFile(filename, "a",
+-                                 compression=zipfile.ZIP_DEFLATED)
+-
+-    def banner(s):
+-      print "\n\n++++ " + s + " ++++\n\n"
+-
+-    banner("boot")
+-    boot_image = common.GetBootableImage(
+-        "IMAGES/boot.img", "boot.img", OPTIONS.input_tmp, "BOOT")
+-    if boot_image:
+-      boot_image.AddToZip(output_zip)
+-
+-    banner("recovery")
+-    recovery_image = common.GetBootableImage(
+-        "IMAGES/recovery.img", "recovery.img", OPTIONS.input_tmp, "RECOVERY")
+-    if recovery_image:
+-      recovery_image.AddToZip(output_zip)
+-
+-    banner("system")
+-    AddSystem(output_zip)
+-    if has_vendor:
+-      banner("vendor")
+-      AddVendor(output_zip)
+-    banner("userdata")
+-    AddUserdata(output_zip)
+-    banner("cache")
+-    AddCache(output_zip)
+-
+-    output_zip.close()
++  for n in input_zip.namelist():
++    if n.startswith("IMAGES/"):
++      print "target_files appears to already contain images."
++      sys.exit(1)
+ 
+-  finally:
+-    shutil.rmtree(OPTIONS.input_tmp)
++  try:
++    input_zip.getinfo("VENDOR/")
++    has_vendor = True
++  except KeyError:
++    has_vendor = False
++
++  OPTIONS.info_dict = common.LoadInfoDict(input_zip)
++  if "selinux_fc" in OPTIONS.info_dict:
++    OPTIONS.info_dict["selinux_fc"] = os.path.join(
++        OPTIONS.input_tmp, "BOOT", "RAMDISK", "file_contexts")
++
++  input_zip.close()
++  output_zip = zipfile.ZipFile(filename, "a",
++                               compression=zipfile.ZIP_DEFLATED)
++
++  def banner(s):
++    print "\n\n++++ " + s + " ++++\n\n"
++
++  banner("boot")
++  boot_image = common.GetBootableImage(
++      "IMAGES/boot.img", "boot.img", OPTIONS.input_tmp, "BOOT")
++  if boot_image:
++    boot_image.AddToZip(output_zip)
++
++  banner("recovery")
++  recovery_image = common.GetBootableImage(
++      "IMAGES/recovery.img", "recovery.img", OPTIONS.input_tmp, "RECOVERY")
++  if recovery_image:
++    recovery_image.AddToZip(output_zip)
++
++  banner("system")
++  AddSystem(output_zip)
++  if has_vendor:
++    banner("vendor")
++    AddVendor(output_zip)
++  banner("userdata")
++  AddUserdata(output_zip)
++  banner("cache")
++  AddCache(output_zip)
++
++  output_zip.close()
+ 
+ 
+ def main(argv):
+@@ -298,3 +264,5 @@ if __name__ == '__main__':
+     print "   ERROR: %s" % (e,)
+     print
+     sys.exit(1)
++  finally:
++    common.Cleanup()
+diff --git a/tools/releasetools/blockimgdiff.py b/tools/releasetools/blockimgdiff.py
+new file mode 100644
+index 000000000..7b01f711d
+--- /dev/null
++++ b/tools/releasetools/blockimgdiff.py
+@@ -0,0 +1,543 @@
++from __future__ import print_function
++
++from collections import deque, OrderedDict
++from hashlib import sha1
++import itertools
++import multiprocessing
++import os
++import pprint
++import re
++import subprocess
++import sys
++import threading
++import tempfile
++
++from rangelib import *
++
++def compute_patch(src, tgt, imgdiff=False):
++  srcfd, srcfile = tempfile.mkstemp(prefix="src-")
++  tgtfd, tgtfile = tempfile.mkstemp(prefix="tgt-")
++  patchfd, patchfile = tempfile.mkstemp(prefix="patch-")
++  os.close(patchfd)
++
++  try:
++    with os.fdopen(srcfd, "wb") as f_src:
++      for p in src:
++        f_src.write(p)
++
++    with os.fdopen(tgtfd, "wb") as f_tgt:
++      for p in tgt:
++        f_tgt.write(p)
++    try:
++      os.unlink(patchfile)
++    except OSError:
++      pass
++    if imgdiff:
++      p = subprocess.call(["imgdiff", "-z", srcfile, tgtfile, patchfile],
++                          stdout=open("/dev/null", "a"),
++                          stderr=subprocess.STDOUT)
++    else:
++      p = subprocess.call(["bsdiff", srcfile, tgtfile, patchfile])
++
++    if p:
++      raise ValueError("diff failed: " + str(p))
++
++    with open(patchfile, "rb") as f:
++      return f.read()
++  finally:
++    try:
++      os.unlink(srcfile)
++      os.unlink(tgtfile)
++      os.unlink(patchfile)
++    except OSError:
++      pass
++
++class EmptyImage(object):
++  """A zero-length image."""
++  blocksize = 4096
++  care_map = RangeSet()
++  total_blocks = 0
++  file_map = {}
++  def ReadRangeSet(self, ranges):
++    return ()
++
++class Transfer(object):
++  def __init__(self, tgt_name, src_name, tgt_ranges, src_ranges, style, by_id):
++    self.tgt_name = tgt_name
++    self.src_name = src_name
++    self.tgt_ranges = tgt_ranges
++    self.src_ranges = src_ranges
++    self.style = style
++    self.intact = (getattr(tgt_ranges, "monotonic", False) and
++                   getattr(src_ranges, "monotonic", False))
++    self.goes_before = {}
++    self.goes_after = {}
++
++    self.id = len(by_id)
++    by_id.append(self)
++
++  def __str__(self):
++    return (str(self.id) + ": <" + str(self.src_ranges) + " " + self.style +
++            " to " + str(self.tgt_ranges) + ">")
++
++
++# BlockImageDiff works on two image objects.  An image object is
++# anything that provides the following attributes:
++#
++#    blocksize: the size in bytes of a block, currently must be 4096.
++#
++#    total_blocks: the total size of the partition/image, in blocks.
++#
++#    care_map: a RangeSet containing which blocks (in the range [0,
++#      total_blocks) we actually care about; i.e. which blocks contain
++#      data.
++#
++#    file_map: a dict that partitions the blocks contained in care_map
++#      into smaller domains that are useful for doing diffs on.
++#      (Typically a domain is a file, and the key in file_map is the
++#      pathname.)
++#
++#    ReadRangeSet(): a function that takes a RangeSet and returns the
++#      data contained in the image blocks of that RangeSet.  The data
++#      is returned as a list or tuple of strings; concatenating the
++#      elements together should produce the requested data.
++#      Implementations are free to break up the data into list/tuple
++#      elements in any way that is convenient.
++#
++# When creating a BlockImageDiff, the src image may be None, in which
++# case the list of transfers produced will never read from the
++# original image.
++
++class BlockImageDiff(object):
++  def __init__(self, tgt, src=None, threads=None):
++    if threads is None:
++      threads = multiprocessing.cpu_count() // 2
++      if threads == 0: threads = 1
++    self.threads = threads
++
++    self.tgt = tgt
++    if src is None:
++      src = EmptyImage()
++    self.src = src
++
++    # The updater code that installs the patch always uses 4k blocks.
++    assert tgt.blocksize == 4096
++    assert src.blocksize == 4096
++
++    # The range sets in each filemap should comprise a partition of
++    # the care map.
++    self.AssertPartition(src.care_map, src.file_map.values())
++    self.AssertPartition(tgt.care_map, tgt.file_map.values())
++
++  def Compute(self, prefix):
++    # When looking for a source file to use as the diff input for a
++    # target file, we try:
++    #   1) an exact path match if available, otherwise
++    #   2) a exact basename match if available, otherwise
++    #   3) a basename match after all runs of digits are replaced by
++    #      "#" if available, otherwise
++    #   4) we have no source for this target.
++    self.AbbreviateSourceNames()
++    self.FindTransfers()
++
++    # Find the ordering dependencies among transfers (this is O(n^2)
++    # in the number of transfers).
++    self.GenerateDigraph()
++    # Find a sequence of transfers that satisfies as many ordering
++    # dependencies as possible (heuristically).
++    self.FindVertexSequence()
++    # Fix up the ordering dependencies that the sequence didn't
++    # satisfy.
++    self.RemoveBackwardEdges()
++    # Double-check our work.
++    self.AssertSequenceGood()
++
++    self.ComputePatches(prefix)
++    self.WriteTransfers(prefix)
++
++  def WriteTransfers(self, prefix):
++    out = []
++
++    out.append("1\n")   # format version number
++    total = 0
++    performs_read = False
++
++    for xf in self.transfers:
++
++      # zero [rangeset]
++      # new [rangeset]
++      # bsdiff patchstart patchlen [src rangeset] [tgt rangeset]
++      # imgdiff patchstart patchlen [src rangeset] [tgt rangeset]
++      # move [src rangeset] [tgt rangeset]
++      # erase [rangeset]
++
++      tgt_size = xf.tgt_ranges.size()
++
++      if xf.style == "new":
++        assert xf.tgt_ranges
++        out.append("%s %s\n" % (xf.style, xf.tgt_ranges.to_string_raw()))
++        total += tgt_size
++      elif xf.style == "move":
++        performs_read = True
++        assert xf.tgt_ranges
++        assert xf.src_ranges.size() == tgt_size
++        if xf.src_ranges != xf.tgt_ranges:
++          out.append("%s %s %s\n" % (
++              xf.style,
++              xf.src_ranges.to_string_raw(), xf.tgt_ranges.to_string_raw()))
++          total += tgt_size
++      elif xf.style in ("bsdiff", "imgdiff"):
++        performs_read = True
++        assert xf.tgt_ranges
++        assert xf.src_ranges
++        out.append("%s %d %d %s %s\n" % (
++            xf.style, xf.patch_start, xf.patch_len,
++            xf.src_ranges.to_string_raw(), xf.tgt_ranges.to_string_raw()))
++        total += tgt_size
++      elif xf.style == "zero":
++        assert xf.tgt_ranges
++        to_zero = xf.tgt_ranges.subtract(xf.src_ranges)
++        if to_zero:
++          out.append("%s %s\n" % (xf.style, to_zero.to_string_raw()))
++          total += to_zero.size()
++      else:
++        raise ValueError, "unknown transfer style '%s'\n" % (xf.style,)
++
++    out.insert(1, str(total) + "\n")
++
++    all_tgt = RangeSet(data=(0, self.tgt.total_blocks))
++    if performs_read:
++      # if some of the original data is used, then at the end we'll
++      # erase all the blocks on the partition that don't contain data
++      # in the new image.
++      new_dontcare = all_tgt.subtract(self.tgt.care_map)
++      if new_dontcare:
++        out.append("erase %s\n" % (new_dontcare.to_string_raw(),))
++    else:
++      # if nothing is read (ie, this is a full OTA), then we can start
++      # by erasing the entire partition.
++      out.insert(2, "erase %s\n" % (all_tgt.to_string_raw(),))
++
++    with open(prefix + ".transfer.list", "wb") as f:
++      for i in out:
++        f.write(i)
++
++  def ComputePatches(self, prefix):
++    print("Reticulating splines...")
++    diff_q = []
++    patch_num = 0
++    with open(prefix + ".new.dat", "wb") as new_f:
++      for xf in self.transfers:
++        if xf.style == "zero":
++          pass
++        elif xf.style == "new":
++          for piece in self.tgt.ReadRangeSet(xf.tgt_ranges):
++            new_f.write(piece)
++        elif xf.style == "diff":
++          src = self.src.ReadRangeSet(xf.src_ranges)
++          tgt = self.tgt.ReadRangeSet(xf.tgt_ranges)
++
++          # We can't compare src and tgt directly because they may have
++          # the same content but be broken up into blocks differently, eg:
++          #
++          #    ["he", "llo"]  vs  ["h", "ello"]
++          #
++          # We want those to compare equal, ideally without having to
++          # actually concatenate the strings (these may be tens of
++          # megabytes).
++
++          src_sha1 = sha1()
++          for p in src:
++            src_sha1.update(p)
++          tgt_sha1 = sha1()
++          tgt_size = 0
++          for p in tgt:
++            tgt_sha1.update(p)
++            tgt_size += len(p)
++
++          if src_sha1.digest() == tgt_sha1.digest():
++            # These are identical; we don't need to generate a patch,
++            # just issue copy commands on the device.
++            xf.style = "move"
++          else:
++            # For files in zip format (eg, APKs, JARs, etc.) we would
++            # like to use imgdiff -z if possible (because it usually
++            # produces significantly smaller patches than bsdiff).
++            # This is permissible if:
++            #
++            #  - the source and target files are monotonic (ie, the
++            #    data is stored with blocks in increasing order), and
++            #  - we haven't removed any blocks from the source set.
++            #
++            # If these conditions are satisfied then appending all the
++            # blocks in the set together in order will produce a valid
++            # zip file (plus possibly extra zeros in the last block),
++            # which is what imgdiff needs to operate.  (imgdiff is
++            # fine with extra zeros at the end of the file.)
++            imgdiff = (xf.intact and
++                       xf.tgt_name.split(".")[-1].lower()
++                       in ("apk", "jar", "zip"))
++            xf.style = "imgdiff" if imgdiff else "bsdiff"
++            diff_q.append((tgt_size, src, tgt, xf, patch_num))
++            patch_num += 1
++
++        else:
++          assert False, "unknown style " + xf.style
++
++    if diff_q:
++      if self.threads > 1:
++        print("Computing patches (using %d threads)..." % (self.threads,))
++      else:
++        print("Computing patches...")
++      diff_q.sort()
++
++      patches = [None] * patch_num
++
++      lock = threading.Lock()
++      def diff_worker():
++        while True:
++          with lock:
++            if not diff_q: return
++            tgt_size, src, tgt, xf, patchnum = diff_q.pop()
++          patch = compute_patch(src, tgt, imgdiff=(xf.style == "imgdiff"))
++          size = len(patch)
++          with lock:
++            patches[patchnum] = (patch, xf)
++            print("%10d %10d (%6.2f%%) %7s %s" % (
++                size, tgt_size, size * 100.0 / tgt_size, xf.style,
++                xf.tgt_name if xf.tgt_name == xf.src_name else (
++                    xf.tgt_name + " (from " + xf.src_name + ")")))
++
++      threads = [threading.Thread(target=diff_worker)
++                 for i in range(self.threads)]
++      for th in threads:
++        th.start()
++      while threads:
++        threads.pop().join()
++    else:
++      patches = []
++
++    p = 0
++    with open(prefix + ".patch.dat", "wb") as patch_f:
++      for patch, xf in patches:
++        xf.patch_start = p
++        xf.patch_len = len(patch)
++        patch_f.write(patch)
++        p += len(patch)
++
++  def AssertSequenceGood(self):
++    # Simulate the sequences of transfers we will output, and check that:
++    # - we never read a block after writing it, and
++    # - we write every block we care about exactly once.
++
++    # Start with no blocks having been touched yet.
++    touched = RangeSet()
++
++    # Imagine processing the transfers in order.
++    for xf in self.transfers:
++      # Check that the input blocks for this transfer haven't yet been touched.
++      assert not touched.overlaps(xf.src_ranges)
++      # Check that the output blocks for this transfer haven't yet been touched.
++      assert not touched.overlaps(xf.tgt_ranges)
++      # Touch all the blocks written by this transfer.
++      touched = touched.union(xf.tgt_ranges)
++
++    # Check that we've written every target block.
++    assert touched == self.tgt.care_map
++
++  def RemoveBackwardEdges(self):
++    print("Removing backward edges...")
++    in_order = 0
++    out_of_order = 0
++    lost_source = 0
++
++    for xf in self.transfers:
++      io = 0
++      ooo = 0
++      lost = 0
++      size = xf.src_ranges.size()
++      for u in xf.goes_before:
++        # xf should go before u
++        if xf.order < u.order:
++          # it does, hurray!
++          io += 1
++        else:
++          # it doesn't, boo.  trim the blocks that u writes from xf's
++          # source, so that xf can go after u.
++          ooo += 1
++          assert xf.src_ranges.overlaps(u.tgt_ranges)
++          xf.src_ranges = xf.src_ranges.subtract(u.tgt_ranges)
++          xf.intact = False
++
++      if xf.style == "diff" and not xf.src_ranges:
++        # nothing left to diff from; treat as new data
++        xf.style = "new"
++
++      lost = size - xf.src_ranges.size()
++      lost_source += lost
++      in_order += io
++      out_of_order += ooo
++
++    print(("  %d/%d dependencies (%.2f%%) were violated; "
++           "%d source blocks removed.") %
++          (out_of_order, in_order + out_of_order,
++           (out_of_order * 100.0 / (in_order + out_of_order))
++           if (in_order + out_of_order) else 0.0,
++           lost_source))
++
++  def FindVertexSequence(self):
++    print("Finding vertex sequence...")
++
++    # This is based on "A Fast & Effective Heuristic for the Feedback
++    # Arc Set Problem" by P. Eades, X. Lin, and W.F. Smyth.  Think of
++    # it as starting with the digraph G and moving all the vertices to
++    # be on a horizontal line in some order, trying to minimize the
++    # number of edges that end up pointing to the left.  Left-pointing
++    # edges will get removed to turn the digraph into a DAG.  In this
++    # case each edge has a weight which is the number of source blocks
++    # we'll lose if that edge is removed; we try to minimize the total
++    # weight rather than just the number of edges.
++
++    # Make a copy of the edge set; this copy will get destroyed by the
++    # algorithm.
++    for xf in self.transfers:
++      xf.incoming = xf.goes_after.copy()
++      xf.outgoing = xf.goes_before.copy()
++
++    # We use an OrderedDict instead of just a set so that the output
++    # is repeatable; otherwise it would depend on the hash values of
++    # the transfer objects.
++    G = OrderedDict()
++    for xf in self.transfers:
++      G[xf] = None
++    s1 = deque()  # the left side of the sequence, built from left to right
++    s2 = deque()  # the right side of the sequence, built from right to left
++
++    while G:
++
++      # Put all sinks at the end of the sequence.
++      while True:
++        sinks = [u for u in G if not u.outgoing]
++        if not sinks: break
++        for u in sinks:
++          s2.appendleft(u)
++          del G[u]
++          for iu in u.incoming:
++            del iu.outgoing[u]
++
++      # Put all the sources at the beginning of the sequence.
++      while True:
++        sources = [u for u in G if not u.incoming]
++        if not sources: break
++        for u in sources:
++          s1.append(u)
++          del G[u]
++          for iu in u.outgoing:
++            del iu.incoming[u]
++
++      if not G: break
++
++      # Find the "best" vertex to put next.  "Best" is the one that
++      # maximizes the net difference in source blocks saved we get by
++      # pretending it's a source rather than a sink.
++
++      max_d = None
++      best_u = None
++      for u in G:
++        d = sum(u.outgoing.values()) - sum(u.incoming.values())
++        if best_u is None or d > max_d:
++          max_d = d
++          best_u = u
++
++      u = best_u
++      s1.append(u)
++      del G[u]
++      for iu in u.outgoing:
++        del iu.incoming[u]
++      for iu in u.incoming:
++        del iu.outgoing[u]
++
++    # Now record the sequence in the 'order' field of each transfer,
++    # and by rearranging self.transfers to be in the chosen sequence.
++
++    new_transfers = []
++    for x in itertools.chain(s1, s2):
++      x.order = len(new_transfers)
++      new_transfers.append(x)
++      del x.incoming
++      del x.outgoing
++
++    self.transfers = new_transfers
++
++  def GenerateDigraph(self):
++    print("Generating digraph...")
++    for a in self.transfers:
++      for b in self.transfers:
++        if a is b: continue
++
++        # If the blocks written by A are read by B, then B needs to go before A.
++        i = a.tgt_ranges.intersect(b.src_ranges)
++        if i:
++          size = i.size()
++          b.goes_before[a] = size
++          a.goes_after[b] = size
++
++  def FindTransfers(self):
++    self.transfers = []
++    empty = RangeSet()
++    for tgt_fn, tgt_ranges in self.tgt.file_map.items():
++      if tgt_fn == "__ZERO":
++        # the special "__ZERO" domain is all the blocks not contained
++        # in any file and that are filled with zeros.  We have a
++        # special transfer style for zero blocks.
++        src_ranges = self.src.file_map.get("__ZERO", empty)
++        Transfer(tgt_fn, None, tgt_ranges, src_ranges, "zero", self.transfers)
++        continue
++
++      elif tgt_fn in self.src.file_map:
++        # Look for an exact pathname match in the source.
++        Transfer(tgt_fn, tgt_fn, tgt_ranges, self.src.file_map[tgt_fn],
++                 "diff", self.transfers)
++        continue
++
++      b = os.path.basename(tgt_fn)
++      if b in self.src_basenames:
++        # Look for an exact basename match in the source.
++        src_fn = self.src_basenames[b]
++        Transfer(tgt_fn, src_fn, tgt_ranges, self.src.file_map[src_fn],
++                 "diff", self.transfers)
++        continue
++
++      b = re.sub("[0-9]+", "#", b)
++      if b in self.src_numpatterns:
++        # Look for a 'number pattern' match (a basename match after
++        # all runs of digits are replaced by "#").  (This is useful
++        # for .so files that contain version numbers in the filename
++        # that get bumped.)
++        src_fn = self.src_numpatterns[b]
++        Transfer(tgt_fn, src_fn, tgt_ranges, self.src.file_map[src_fn],
++                 "diff", self.transfers)
++        continue
++
++      Transfer(tgt_fn, None, tgt_ranges, empty, "new", self.transfers)
++
++  def AbbreviateSourceNames(self):
++    self.src_basenames = {}
++    self.src_numpatterns = {}
++
++    for k in self.src.file_map.keys():
++      b = os.path.basename(k)
++      self.src_basenames[b] = k
++      b = re.sub("[0-9]+", "#", b)
++      self.src_numpatterns[b] = k
++
++  @staticmethod
++  def AssertPartition(total, seq):
++    """Assert that all the RangeSets in 'seq' form a partition of the
++    'total' RangeSet (ie, they are nonintersecting and their union
++    equals 'total')."""
++    so_far = RangeSet()
++    for i in seq:
++      assert not so_far.overlaps(i)
++      so_far = so_far.union(i)
++    assert so_far == total
+diff --git a/tools/releasetools/build_image.py b/tools/releasetools/build_image.py
+index 5ae8d3c26..a010e8415 100755
+--- a/tools/releasetools/build_image.py
++++ b/tools/releasetools/build_image.py
+@@ -28,8 +28,6 @@ import commands
+ import shutil
+ import tempfile
+ 
+-import simg_map
+-
+ FIXED_SALT = "aee087a5be3b982978c923f566a94613496b417f2af592639bc80d141e34dfe7"
+ 
+ def RunCommand(cmd):
+@@ -150,13 +148,6 @@ def UnsparseImage(sparse_image_path, replace=True):
+     return False, None
+   return True, unsparse_image_path
+ 
+-def MappedUnsparseImage(sparse_image_path, unsparse_image_path,
+-                        map_path, mapped_unsparse_image_path):
+-  if simg_map.ComputeMap(sparse_image_path, unsparse_image_path,
+-                         map_path, mapped_unsparse_image_path):
+-    return False
+-  return True
+-
+ def MakeVerityEnabledImage(out_file, prop_dict):
+   """Creates an image that is verifiable using dm-verity.
+ 
+diff --git a/tools/releasetools/common.py b/tools/releasetools/common.py
+index 09798bc7e..3f8cda7ec 100644
+--- a/tools/releasetools/common.py
++++ b/tools/releasetools/common.py
+@@ -652,6 +652,15 @@ def ParseOptions(argv,
+   return args
+ 
+ 
++def MakeTempFile(prefix=None, suffix=None):
++  """Make a temp file and add it to the list of things to be deleted
++  when Cleanup() is called.  Return the filename."""
++  fd, fn = tempfile.mkstemp(prefix=prefix, suffix=suffix)
++  os.close(fd)
++  OPTIONS.tempfiles.append(fn)
++  return fn
++
++
+ def Cleanup():
+   for i in OPTIONS.tempfiles:
+     if os.path.isdir(i):
+diff --git a/tools/releasetools/edify_generator.py b/tools/releasetools/edify_generator.py
+index 86208121e..2bd071d4b 100644
+--- a/tools/releasetools/edify_generator.py
++++ b/tools/releasetools/edify_generator.py
+@@ -334,10 +334,3 @@ class EdifyGenerator(object):
+       data = open(input_path, "rb").read()
+     common.ZipWriteStr(output_zip, "META-INF/com/google/android/update-binary",
+                        data, perms=0755)
+-
+-  def Syspatch(self, filename, target_mapfile, target_sha,
+-               source_mapfile, source_sha, patchfile):
+-    """Applies a compressed binary patch to a block device."""
+-    call = 'syspatch("%s", "%s", "%s", "%s", "%s", "%s");'
+-    self.script.append(call % (filename, target_mapfile, target_sha,
+-                               source_mapfile, source_sha, patchfile))
+diff --git a/tools/releasetools/ota_from_target_files b/tools/releasetools/ota_from_target_files
+index 9f701679b..bcc3210f3 100755
+--- a/tools/releasetools/ota_from_target_files
++++ b/tools/releasetools/ota_from_target_files
+@@ -85,6 +85,7 @@ if sys.hexversion < 0x02070000:
+ 
+ import copy
+ import errno
++import multiprocessing
+ import os
+ import re
+ import subprocess
+@@ -92,14 +93,13 @@ import tempfile
+ import time
+ import zipfile
+ 
+-try:
+-  from hashlib import sha1 as sha1
+-except ImportError:
+-  from sha import sha as sha1
++from hashlib import sha1 as sha1
+ 
+ import common
+ import edify_generator
+ import build_image
++import blockimgdiff
++import sparse_img
+ 
+ OPTIONS = common.OPTIONS
+ OPTIONS.package_key = None
+@@ -111,7 +111,9 @@ OPTIONS.wipe_user_data = False
+ OPTIONS.omit_prereq = False
+ OPTIONS.extra_script = None
+ OPTIONS.aslr_mode = True
+-OPTIONS.worker_threads = 3
++OPTIONS.worker_threads = multiprocessing.cpu_count() // 2
++if OPTIONS.worker_threads == 0:
++  OPTIONS.worker_threads = 1
+ OPTIONS.two_step = False
+ OPTIONS.no_signing = False
+ OPTIONS.block_based = False
+@@ -418,44 +420,20 @@ def CalculateFingerprint(oem_props, oem_dict, info_dict):
+     GetOemProperty("ro.product.device", oem_props, oem_dict, info_dict),
+     GetBuildProp("ro.build.thumbprint", info_dict))
+ 
++
+ def GetImage(which, tmpdir, info_dict):
+-  # Return (mapdata, data) for the given image.  which should be
+-  # "system" or "vendor".
++  # Return an image object (suitable for passing to BlockImageDiff)
++  # for the 'which' partition (most be "system" or "vendor").  If a
++  # prebuilt image and file map are found in tmpdir they are used,
++  # otherwise they are reconstructed from the individual files.
+ 
+   assert which in ("system", "vendor")
+ 
+   path = os.path.join(tmpdir, "IMAGES", which + ".img")
+-  if os.path.exists(path):
++  mappath = os.path.join(tmpdir, "IMAGES", which + ".map")
++  if os.path.exists(path) and os.path.exists(mappath):
+     print "using %s.img from target-files" % (which,)
+-
+     # This is a 'new' target-files, which already has the image in it.
+-    # The image is a sparse image, though, so we need to unsparse it
+-    # and extract the map data.
+-
+-    success, name = build_image.UnsparseImage(path, replace=False)
+-    if not success:
+-      assert False, "unsparsing " + which + ".img failed"
+-
+-    mmap = tempfile.NamedTemporaryFile()
+-    mimg = tempfile.NamedTemporaryFile(delete=False)
+-    success = build_image.MappedUnsparseImage(
+-        path, name, mmap.name, mimg.name)
+-    if not success:
+-      assert False, "creating sparse map failed"
+-    os.unlink(name)
+-    name = mimg.name
+-
+-    with open(mmap.name) as f:
+-      mapdata = f.read()
+-
+-    try:
+-      with open(name) as f:
+-        data = f.read()
+-    finally:
+-      os.unlink(name)
+-
+-    print "unsparsed data sha1 is " + sha1(data).hexdigest()
+-    return mapdata, data
+ 
+   else:
+     print "building %s.img from target-files" % (which,)
+@@ -463,16 +441,47 @@ def GetImage(which, tmpdir, info_dict):
+     # This is an 'old' target-files, which does not contain images
+     # already built.  Build them.
+ 
++    mappath = tempfile.mkstemp()[1]
++    OPTIONS.tempfiles.append(mappath)
++
+     import add_img_to_target_files
+     if which == "system":
+-      mapdata, data = add_img_to_target_files.BuildSystem(
+-          tmpdir, info_dict, sparse=False, map_file=True)
++      path = add_img_to_target_files.BuildSystem(
++          tmpdir, info_dict, block_list=mappath)
+     elif which == "vendor":
+-      mapdata, data = add_img_to_target_files.BuildVendor(
+-          tmpdir, info_dict, sparse=False, map_file=True)
++      path = add_img_to_target_files.BuildVendor(
++          tmpdir, info_dict, block_list=mappath)
++
++  return sparse_img.SparseImage(path, mappath)
++
++
++class BlockDifference:
++  def __init__(self, partition, tgt, src=None):
++    self.partition = partition
+ 
+-    print "built data sha1 is " + sha1(data).hexdigest()
+-    return mapdata, data
++    b = blockimgdiff.BlockImageDiff(tgt, src, threads=OPTIONS.worker_threads)
++    tmpdir = tempfile.mkdtemp()
++    OPTIONS.tempfiles.append(tmpdir)
++    self.path = os.path.join(tmpdir, partition)
++    b.Compute(self.path)
++
++    _, self.device = common.GetTypeAndDevice("/" + partition, OPTIONS.info_dict)
++
++  def WriteScript(self, script, output_zip):
++    partition = self.partition
++    with open(self.path + ".transfer.list", "rb") as f:
++      common.ZipWriteStr(output_zip, partition + ".transfer.list", f.read())
++    with open(self.path + ".new.dat", "rb") as f:
++      common.ZipWriteStr(output_zip, partition + ".new.dat", f.read())
++    with open(self.path + ".patch.dat", "rb") as f:
++      common.ZipWriteStr(output_zip, partition + ".patch.dat", f.read(),
++                         compression=zipfile.ZIP_STORED)
++
++    call = (('block_image_update("%s", '
++             'package_extract_file("%s.transfer.list"), '
++             '"%s.new.dat", "%s.patch.dat");\n') %
++            (self.device, partition, partition, partition))
++    script.AppendExtra(script._WordWrap(call))
+ 
+ 
+ def WriteFullOTAPackage(input_zip, output_zip):
+@@ -571,12 +580,14 @@ else if get_stage("%(bcb_dev)s", "stage") == "3/3" then
+   system_items = ItemSet("system", "META/filesystem_config.txt")
+   script.ShowProgress(system_progress, 0)
+   if block_based:
+-    mapdata, data = GetImage("system", OPTIONS.input_tmp, OPTIONS.info_dict)
+-
+-    common.ZipWriteStr(output_zip, "system.map", mapdata)
+-    common.ZipWriteStr(output_zip, "system.muimg", data)
+-    script.WipeBlockDevice("/system")
+-    script.WriteRawImage("/system", "system.muimg", mapfn="system.map")
++    # Full OTA is done as an "incremental" against an empty source
++    # image.  This has the effect of writing new data from the package
++    # to the entire partition, but lets us reuse the updater code that
++    # writes incrementals to do it.
++    system_tgt = GetImage("system", OPTIONS.input_tmp, OPTIONS.info_dict)
++    system_tgt.ResetFileMap()
++    system_diff = BlockDifference("system", system_tgt, src=None)
++    system_diff.WriteScript(script, output_zip)
+   else:
+     script.FormatPartition("/system")
+     script.Mount("/system")
+@@ -606,12 +617,10 @@ else if get_stage("%(bcb_dev)s", "stage") == "3/3" then
+     script.ShowProgress(0.1, 0)
+ 
+     if block_based:
+-      mapdata, data = GetImage("vendor", OPTIONS.input_tmp, OPTIONS.info_dict)
+-
+-      common.ZipWriteStr(output_zip, "vendor.map", mapdata)
+-      common.ZipWriteStr(output_zip, "vendor.muimg", data)
+-      script.WipeBlockDevice("/vendor")
+-      script.WriteRawImage("/vendor", "vendor.muimg", mapfn="vendor.map")
++      vendor_tgt = GetImage("vendor", OPTIONS.input_tmp, OPTIONS.info_dict)
++      vendor_tgt.ResetFileMap()
++      vendor_diff = BlockDifference("vendor", vendor_tgt)
++      vendor_diff.WriteScript(script, output_zip)
+     else:
+       script.FormatPartition("/vendor")
+       script.Mount("/vendor")
+@@ -656,6 +665,7 @@ endif;
+   script.AddToZip(input_zip, output_zip, input_path=OPTIONS.updater_binary)
+   WriteMetadata(metadata, output_zip)
+ 
++
+ def WritePolicyConfig(file_context, output_zip):
+   f = open(file_context, 'r');
+   basename = os.path.basename(file_context)
+@@ -667,6 +677,7 @@ def WriteMetadata(metadata, output_zip):
+                      "".join(["%s=%s\n" % kv
+                               for kv in sorted(metadata.iteritems())]))
+ 
++
+ def LoadPartitionFiles(z, partition):
+   """Load all the files from the given partition in a given target-files
+   ZipFile, and return a dict of {filename: File object}."""
+@@ -688,6 +699,7 @@ def GetBuildProp(prop, info_dict):
+   except KeyError:
+     raise common.ExternalError("couldn't find %s in build.prop" % (prop,))
+ 
++
+ def AddToKnownPaths(filename, known_paths):
+   if filename[-1] == "/":
+     return
+@@ -699,44 +711,6 @@ def AddToKnownPaths(filename, known_paths):
+     known_paths.add(path)
+     dirs.pop()
+ 
+-class BlockDifference:
+-  def __init__(self, partition, output_zip):
+-    with tempfile.NamedTemporaryFile() as src_file:
+-      with tempfile.NamedTemporaryFile() as tgt_file:
+-        print "building source " + partition + " image..."
+-        src_file = tempfile.NamedTemporaryFile()
+-        src_mapdata, src_data = GetImage(partition,
+-                                         OPTIONS.source_tmp,
+-                                         OPTIONS.source_info_dict)
+-
+-        self.src_sha1 = sha1(src_data).hexdigest()
+-        print "source " + partition + " sha1:", self.src_sha1
+-        src_file.write(src_data)
+-
+-        print "building target " + partition + " image..."
+-        tgt_file = tempfile.NamedTemporaryFile()
+-        tgt_mapdata, tgt_data = GetImage(partition,
+-                                         OPTIONS.target_tmp,
+-                                         OPTIONS.target_info_dict)
+-        self.tgt_sha1 = sha1(tgt_data).hexdigest()
+-        print "target " + partition + " sha1:", self.tgt_sha1
+-        tgt_len = len(tgt_data)
+-        tgt_file.write(tgt_data)
+-
+-        system_type, self.device = common.GetTypeAndDevice("/" + partition,
+-                                                           OPTIONS.info_dict)
+-        self.patch = common.MakePartitionPatch(src_file, tgt_file, partition)
+-
+-        TestBlockPatch(src_data, src_mapdata, self.patch.data,
+-                       tgt_mapdata, self.tgt_sha1)
+-        src_data = None
+-        tgt_data = None
+-
+-        self.patch.AddToZip(output_zip, compression=zipfile.ZIP_STORED)
+-        self.src_mapfilename = self.patch.name + ".src.map"
+-        common.ZipWriteStr(output_zip, self.src_mapfilename, src_mapdata)
+-        self.tgt_mapfilename = self.patch.name + ".tgt.map"
+-        common.ZipWriteStr(output_zip, self.tgt_mapfilename, tgt_mapdata)
+ 
+ def WriteBlockIncrementalOTAPackage(target_zip, source_zip, output_zip):
+   source_version = OPTIONS.source_info_dict["recovery_api_version"]
+@@ -784,11 +758,18 @@ def WriteBlockIncrementalOTAPackage(target_zip, source_zip, output_zip):
+       "/tmp/recovery.img", "recovery.img", OPTIONS.target_tmp, "RECOVERY")
+   updating_recovery = (source_recovery.data != target_recovery.data)
+ 
+-  system_diff = BlockDifference("system", output_zip)
++  system_src = GetImage("system", OPTIONS.source_tmp, OPTIONS.source_info_dict)
++  system_tgt = GetImage("system", OPTIONS.target_tmp, OPTIONS.target_info_dict)
++  system_diff = BlockDifference("system", system_tgt, system_src)
++
+   if HasVendorPartition(target_zip):
+     if not HasVendorPartition(source_zip):
+       raise RuntimeError("can't generate incremental that adds /vendor")
+-    vendor_diff = BlockDifference("vendor", output_zip)
++    vendor_src = GetImage("vendor", OPTIONS.source_tmp, OPTIONS.source_info_dict)
++    vendor_tgt = GetImage("vendor", OPTIONS.target_tmp, OPTIONS.target_info_dict)
++    vendor_diff = BlockDifference("vendor", vendor_tgt, vendor_src)
++  else:
++    vendor_diff = None
+ 
+   oem_props = OPTIONS.target_info_dict.get("oem_fingerprint_properties")
+   oem_dict = None
+@@ -886,23 +867,32 @@ else
+ 
+   device_specific.IncrementalOTA_InstallBegin()
+ 
+-  if HasVendorPartition(target_zip):
++  script.AppendExtra('if range_sha1("%s", "%s") == "%s" then' %
++                     (system_diff.device, system_src.care_map.to_string_raw(),
++                      system_src.TotalSha1()))
++  script.Print("Patching system image...")
++  script.ShowProgress(0.8 if vendor_diff else 0.9, 0)
++  system_diff.WriteScript(script, output_zip)
++  script.AppendExtra(('else\n'
++                      '  (range_sha1("%s", "%s") == "%s") ||\n'
++                      '  abort("system partition has unexpected contents");\n'
++                      'endif;') %
++                     (system_diff.device, system_tgt.care_map.to_string_raw(),
++                      system_tgt.TotalSha1()))
++
++  if vendor_diff:
++    script.AppendExtra('if range_sha1("%s", "%s") == "%s" then' %
++                       (vendor_diff.device, vendor_src.care_map.to_string_raw(),
++                        vendor_src.TotalSha1()))
+     script.Print("Patching vendor image...")
+     script.ShowProgress(0.1, 0)
+-    script.Syspatch(vendor_diff.device,
+-                    vendor_diff.tgt_mapfilename, vendor_diff.tgt_sha1,
+-                    vendor_diff.src_mapfilename, vendor_diff.src_sha1,
+-                    vendor_diff.patch.name)
+-    sys_progress = 0.8
+-  else:
+-    sys_progress = 0.9
+-
+-  script.Print("Patching system image...")
+-  script.ShowProgress(sys_progress, 0)
+-  script.Syspatch(system_diff.device,
+-                  system_diff.tgt_mapfilename, system_diff.tgt_sha1,
+-                  system_diff.src_mapfilename, system_diff.src_sha1,
+-                  system_diff.patch.name)
++    vendor_diff.WriteScript(script, output_zip)
++    script.AppendExtra(('else\n'
++                        '  (range_sha1("%s", "%s") == "%s") ||\n'
++                        '  abort("vendor partition has unexpected contents");\n'
++                        'endif;') %
++                       (vendor_diff.device, vendor_tgt.care_map.to_string_raw(),
++                        vendor_tgt.TotalSha1()))
+ 
+   if OPTIONS.two_step:
+     common.ZipWriteStr(output_zip, "boot.img", target_boot.data)
+@@ -953,61 +943,6 @@ endif;
+   script.AddToZip(target_zip, output_zip, input_path=OPTIONS.updater_binary)
+   WriteMetadata(metadata, output_zip)
+ 
+-def ParseMap(map_str):
+-  x = map_str.split()
+-  assert int(x[0]) == 4096
+-  assert int(x[1]) == len(x)-2
+-  return int(x[0]), [int(i) for i in x[2:]]
+-
+-def TestBlockPatch(src_muimg, src_map, patch_data, tgt_map, tgt_sha1):
+-  src_blksize, src_regions = ParseMap(src_map)
+-  tgt_blksize, tgt_regions = ParseMap(tgt_map)
+-
+-  with tempfile.NamedTemporaryFile() as src_file,\
+-       tempfile.NamedTemporaryFile() as patch_file,\
+-       tempfile.NamedTemporaryFile() as src_map_file,\
+-       tempfile.NamedTemporaryFile() as tgt_map_file:
+-
+-    src_total = sum(src_regions) * src_blksize
+-    src_file.truncate(src_total)
+-    p = 0
+-    for i in range(0, len(src_regions), 2):
+-      c, dc = src_regions[i:i+2]
+-      src_file.write(src_muimg[p:(p+c*src_blksize)])
+-      p += c*src_blksize
+-      src_file.seek(dc*src_blksize, 1)
+-    assert src_file.tell() == src_total
+-
+-    patch_file.write(patch_data)
+-
+-    src_map_file.write(src_map)
+-    tgt_map_file.write(tgt_map)
+-
+-    src_file.flush()
+-    src_map_file.flush()
+-    patch_file.flush()
+-    tgt_map_file.flush()
+-
+-    p = common.Run(["syspatch_host", src_file.name, src_map_file.name,
+-                    patch_file.name, src_file.name, tgt_map_file.name],
+-                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+-    stdoutdata, _ = p.communicate()
+-    if p.returncode != 0:
+-      print stdoutdata
+-      raise ValueError("failed to reconstruct target system image from patch")
+-
+-    h = sha1()
+-    src_file.seek(0, 0)
+-    for i in range(0, len(tgt_regions), 2):
+-      c, dc = tgt_regions[i:i+2]
+-      h.update(src_file.read(c*tgt_blksize))
+-      src_file.seek(dc*tgt_blksize, 1)
+-
+-    if h.hexdigest() != tgt_sha1:
+-      raise ValueError("patch reconstructed incorrect target system image")
+-
+-  print "test of system image patch succeeded"
+-
+ 
+ class FileDifference:
+   def __init__(self, partition, source_zip, target_zip, output_zip):
+@@ -1616,8 +1551,6 @@ def main(argv):
+     SignOutput(temp_zip_file.name, args[1])
+     temp_zip_file.close()
+ 
+-  common.Cleanup()
+-
+   print "done."
+ 
+ 
+@@ -1630,3 +1563,5 @@ if __name__ == '__main__':
+     print "   ERROR: %s" % (e,)
+     print
+     sys.exit(1)
++  finally:
++    common.Cleanup()
+diff --git a/tools/releasetools/rangelib.py b/tools/releasetools/rangelib.py
+new file mode 100644
+index 000000000..b61714bb6
+--- /dev/null
++++ b/tools/releasetools/rangelib.py
+@@ -0,0 +1,161 @@
++from __future__ import print_function
++import heapq
++import itertools
++
++__all__ = ["RangeSet"]
++
++class RangeSet(object):
++  """A RangeSet represents a set of nonoverlapping ranges on the
++  integers (ie, a set of integers, but efficient when the set contains
++  lots of runs."""
++
++  def __init__(self, data=None):
++    if data:
++      self.data = tuple(self._remove_pairs(data))
++    else:
++      self.data = ()
++
++  def __iter__(self):
++    for i in range(0, len(self.data), 2):
++      yield self.data[i:i+2]
++
++  def __eq__(self, other):
++    return self.data == other.data
++  def __ne__(self, other):
++    return self.data != other.data
++  def __nonzero__(self):
++    return bool(self.data)
++
++  def __str__(self):
++    if not self.data:
++      return "empty"
++    else:
++      return self.to_string()
++
++  @classmethod
++  def parse(cls, text):
++    """Parse a text string consisting of a space-separated list of
++    blocks and ranges, eg "10-20 30 35-40".  Ranges are interpreted to
++    include both their ends (so the above example represents 18
++    individual blocks.  Returns a RangeSet object.
++
++    If the input has all its blocks in increasing order, then returned
++    RangeSet will have an extra attribute 'monotonic' that is set to
++    True.  For example the input "10-20 30" is monotonic, but the input
++    "15-20 30 10-14" is not, even though they represent the same set
++    of blocks (and the two RangeSets will compare equal with ==).
++    """
++
++    data = []
++    last = -1
++    monotonic = True
++    for p in text.split():
++      if "-" in p:
++        s, e = p.split("-")
++        data.append(int(s))
++        data.append(int(e)+1)
++        if last <= s <= e:
++          last = e
++        else:
++          monotonic = False
++      else:
++        s = int(p)
++        data.append(s)
++        data.append(s+1)
++        if last <= s:
++          last = s+1
++        else:
++          monotonic = True
++    data.sort()
++    r = RangeSet(cls._remove_pairs(data))
++    r.monotonic = monotonic
++    return r
++
++  @staticmethod
++  def _remove_pairs(source):
++    last = None
++    for i in source:
++      if i == last:
++        last = None
++      else:
++        if last is not None:
++          yield last
++        last = i
++    if last is not None:
++      yield last
++
++  def to_string(self):
++    out = []
++    for i in range(0, len(self.data), 2):
++      s, e = self.data[i:i+2]
++      if e == s+1:
++        out.append(str(s))
++      else:
++        out.append(str(s) + "-" + str(e-1))
++    return " ".join(out)
++
++  def to_string_raw(self):
++    return str(len(self.data)) + "," + ",".join(str(i) for i in self.data)
++
++  def union(self, other):
++    """Return a new RangeSet representing the union of this RangeSet
++    with the argument."""
++    out = []
++    z = 0
++    for p, d in heapq.merge(zip(self.data, itertools.cycle((+1, -1))),
++                            zip(other.data, itertools.cycle((+1, -1)))):
++      if (z == 0 and d == 1) or (z == 1 and d == -1):
++        out.append(p)
++      z += d
++    return RangeSet(data=out)
++
++  def intersect(self, other):
++    """Return a new RangeSet representing the intersection of this
++    RangeSet with the argument."""
++    out = []
++    z = 0
++    for p, d in heapq.merge(zip(self.data, itertools.cycle((+1, -1))),
++                            zip(other.data, itertools.cycle((+1, -1)))):
++      if (z == 1 and d == 1) or (z == 2 and d == -1):
++        out.append(p)
++      z += d
++    return RangeSet(data=out)
++
++  def subtract(self, other):
++    """Return a new RangeSet representing subtracting the argument
++    from this RangeSet."""
++
++    out = []
++    z = 0
++    for p, d in heapq.merge(zip(self.data, itertools.cycle((+1, -1))),
++                            zip(other.data, itertools.cycle((-1, +1)))):
++      if (z == 0 and d == 1) or (z == 1 and d == -1):
++        out.append(p)
++      z += d
++    return RangeSet(data=out)
++
++  def overlaps(self, other):
++    """Returns true if the argument has a nonempty overlap with this
++    RangeSet."""
++
++    # This is like intersect, but we can stop as soon as we discover the
++    # output is going to be nonempty.
++    z = 0
++    for p, d in heapq.merge(zip(self.data, itertools.cycle((+1, -1))),
++                            zip(other.data, itertools.cycle((+1, -1)))):
++      if (z == 1 and d == 1) or (z == 2 and d == -1):
++        return True
++      z += d
++    return False
++
++  def size(self):
++    """Returns the total size of the RangeSet (ie, how many integers
++    are in the set)."""
++
++    total = 0
++    for i, p in enumerate(self.data):
++      if i % 2:
++        total += p
++      else:
++        total -= p
++    return total
+diff --git a/tools/releasetools/simg_map.py b/tools/releasetools/simg_map.py
+deleted file mode 100644
+index 22dc8635d..000000000
+--- a/tools/releasetools/simg_map.py
++++ /dev/null
+@@ -1,148 +0,0 @@
+-#! /usr/bin/env python
+-
+-# Copyright (C) 2012 The Android Open Source Project
+-#
+-# Licensed under the Apache License, Version 2.0 (the "License");
+-# you may not use this file except in compliance with the License.
+-# You may obtain a copy of the License at
+-#
+-#      http://www.apache.org/licenses/LICENSE-2.0
+-#
+-# Unless required by applicable law or agreed to in writing, software
+-# distributed under the License is distributed on an "AS IS" BASIS,
+-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-# See the License for the specific language governing permissions and
+-# limitations under the License.
+-
+-from __future__ import print_function
+-import getopt, posixpath, signal, struct, sys
+-
+-def main():
+-  if len(sys.argv) == 4:
+-    print("No sparse_image_file specified")
+-    usage(me)
+-
+-  sparse_fn = sys.argv[1]
+-  unsparse_fn = sys.argv[2]
+-  map_file = sys.argv[3]
+-  mapped_unsparse_fn = sys.argv[4]
+-
+-  return ComputeMap(sparse_fn, unsparse_fn, map_file, mapped_unsparse_fn)
+-
+-
+-def ComputeMap(sparse_fn, unsparse_fn, map_file, mapped_unsparse_fn):
+-  care_map = []
+-
+-  with open(sparse_fn, "rb") as FH:
+-    header_bin = FH.read(28)
+-    header = struct.unpack("<I4H4I", header_bin)
+-
+-    magic = header[0]
+-    major_version = header[1]
+-    minor_version = header[2]
+-    file_hdr_sz = header[3]
+-    chunk_hdr_sz = header[4]
+-    blk_sz = header[5]
+-    total_blks = header[6]
+-    total_chunks = header[7]
+-    image_checksum = header[8]
+-
+-    if magic != 0xED26FF3A:
+-      print("%s: %s: Magic should be 0xED26FF3A but is 0x%08X"
+-            % (me, path, magic))
+-      return 1
+-    if major_version != 1 or minor_version != 0:
+-      print("%s: %s: I only know about version 1.0, but this is version %u.%u"
+-            % (me, path, major_version, minor_version))
+-      return 1
+-    if file_hdr_sz != 28:
+-      print("%s: %s: The file header size was expected to be 28, but is %u."
+-            % (me, path, file_hdr_sz))
+-      return 1
+-    if chunk_hdr_sz != 12:
+-      print("%s: %s: The chunk header size was expected to be 12, but is %u."
+-            % (me, path, chunk_hdr_sz))
+-      return 1
+-
+-    print("%s: Total of %u %u-byte output blocks in %u input chunks."
+-          % (sparse_fn, total_blks, blk_sz, total_chunks))
+-
+-    offset = 0
+-    for i in range(total_chunks):
+-      header_bin = FH.read(12)
+-      header = struct.unpack("<2H2I", header_bin)
+-      chunk_type = header[0]
+-      reserved1 = header[1]
+-      chunk_sz = header[2]
+-      total_sz = header[3]
+-      data_sz = total_sz - 12
+-
+-      if chunk_type == 0xCAC1:
+-        if data_sz != (chunk_sz * blk_sz):
+-          print("Raw chunk input size (%u) does not match output size (%u)"
+-                % (data_sz, chunk_sz * blk_sz))
+-          return 1
+-        else:
+-          care_map.append((1, chunk_sz))
+-          FH.seek(data_sz, 1)
+-
+-      elif chunk_type == 0xCAC2:
+-        print("Fill chunks are not supported")
+-        return 1
+-
+-      elif chunk_type == 0xCAC3:
+-        if data_sz != 0:
+-          print("Don't care chunk input size is non-zero (%u)" % (data_sz))
+-          return 1
+-        else:
+-          care_map.append((0, chunk_sz))
+-
+-      elif chunk_type == 0xCAC4:
+-        print("CRC32 chunks are not supported")
+-
+-      else:
+-        print("Unknown chunk type 0x%04X not supported" % (chunk_type,))
+-        return 1
+-
+-      offset += chunk_sz
+-
+-    if total_blks != offset:
+-      print("The header said we should have %u output blocks, but we saw %u"
+-            % (total_blks, offset))
+-
+-    junk_len = len(FH.read())
+-    if junk_len:
+-      print("There were %u bytes of extra data at the end of the file."
+-            % (junk_len))
+-      return 1
+-
+-  last_kind = None
+-  new_care_map = []
+-  for kind, size in care_map:
+-    if kind != last_kind:
+-      new_care_map.append((kind, size))
+-      last_kind = kind
+-    else:
+-      new_care_map[-1] = (kind, new_care_map[-1][1] + size)
+-
+-  if new_care_map[0][0] == 0:
+-    new_care_map.insert(0, (1, 0))
+-  if len(new_care_map) % 2:
+-    new_care_map.append((0, 0))
+-
+-  with open(map_file, "w") as fmap:
+-    fmap.write("%d\n%d\n" % (blk_sz, len(new_care_map)))
+-    for _, sz in new_care_map:
+-      fmap.write("%d\n" % sz)
+-
+-  with open(unsparse_fn, "rb") as fin:
+-    with open(mapped_unsparse_fn, "wb") as fout:
+-      for k, sz in care_map:
+-        data = fin.read(sz * blk_sz)
+-        if k:
+-          fout.write(data)
+-        else:
+-          assert data == "\x00" * len(data)
+-
+-if __name__ == "__main__":
+-  sys.exit(main())
+diff --git a/tools/releasetools/sparse_img.py b/tools/releasetools/sparse_img.py
+new file mode 100644
+index 000000000..ef7ff923d
+--- /dev/null
++++ b/tools/releasetools/sparse_img.py
+@@ -0,0 +1,184 @@
++import bisect
++import os
++import sys
++import struct
++import pprint
++from hashlib import sha1
++
++from rangelib import *
++
++class SparseImage(object):
++  """Wraps a sparse image file (and optional file map) into an image
++  object suitable for passing to BlockImageDiff."""
++
++  def __init__(self, simg_fn, file_map_fn=None):
++    self.simg_f = f = open(simg_fn, "rb")
++
++    header_bin = f.read(28)
++    header = struct.unpack("<I4H4I", header_bin)
++
++    magic = header[0]
++    major_version = header[1]
++    minor_version = header[2]
++    file_hdr_sz = header[3]
++    chunk_hdr_sz = header[4]
++    self.blocksize = blk_sz = header[5]
++    self.total_blocks = total_blks = header[6]
++    total_chunks = header[7]
++    image_checksum = header[8]
++
++    if magic != 0xED26FF3A:
++      raise ValueError("Magic should be 0xED26FF3A but is 0x%08X" % (magic,))
++    if major_version != 1 or minor_version != 0:
++      raise ValueError("I know about version 1.0, but this is version %u.%u" %
++                       (major_version, minor_version))
++    if file_hdr_sz != 28:
++      raise ValueError("File header size was expected to be 28, but is %u." %
++                       (file_hdr_sz,))
++    if chunk_hdr_sz != 12:
++      raise ValueError("Chunk header size was expected to be 12, but is %u." %
++                       (chunk_hdr_sz,))
++
++    print("Total of %u %u-byte output blocks in %u input chunks."
++          % (total_blks, blk_sz, total_chunks))
++
++    pos = 0   # in blocks
++    care_data = []
++    self.offset_map = offset_map = []
++
++    for i in range(total_chunks):
++      header_bin = f.read(12)
++      header = struct.unpack("<2H2I", header_bin)
++      chunk_type = header[0]
++      reserved1 = header[1]
++      chunk_sz = header[2]
++      total_sz = header[3]
++      data_sz = total_sz - 12
++
++      if chunk_type == 0xCAC1:
++        if data_sz != (chunk_sz * blk_sz):
++          raise ValueError(
++              "Raw chunk input size (%u) does not match output size (%u)" %
++              (data_sz, chunk_sz * blk_sz))
++        else:
++          care_data.append(pos)
++          care_data.append(pos + chunk_sz)
++          offset_map.append((pos, chunk_sz, f.tell()))
++          pos += chunk_sz
++          f.seek(data_sz, os.SEEK_CUR)
++
++      elif chunk_type == 0xCAC2:
++        raise ValueError("Fill chunks are not supported")
++
++      elif chunk_type == 0xCAC3:
++        if data_sz != 0:
++          raise ValueError("Don't care chunk input size is non-zero (%u)" %
++                           (data_sz))
++        else:
++          pos += chunk_sz
++
++      elif chunk_type == 0xCAC4:
++        raise ValueError("CRC32 chunks are not supported")
++
++      else:
++        raise ValueError("Unknown chunk type 0x%04X not supported" %
++                         (chunk_type,))
++
++    self.care_map = RangeSet(care_data)
++    self.offset_index = [i[0] for i in offset_map]
++
++    if file_map_fn:
++      self.LoadFileBlockMap(file_map_fn)
++    else:
++      self.file_map = {"__DATA": self.care_map}
++
++  def ReadRangeSet(self, ranges):
++    return [d for d in self._GetRangeData(ranges)]
++
++  def TotalSha1(self):
++    """Return the SHA-1 hash of all data in the 'care' regions of this image."""
++    h = sha1()
++    for d in self._GetRangeData(self.care_map):
++      h.update(d)
++    return h.hexdigest()
++
++  def _GetRangeData(self, ranges):
++    """Generator that produces all the image data in 'ranges'.  The
++    number of individual pieces returned is arbitrary (and in
++    particular is not necessarily equal to the number of ranges in
++    'ranges'.
++
++    This generator is stateful -- it depends on the open file object
++    contained in this SparseImage, so you should not try to run two
++    instances of this generator on the same object simultaneously."""
++
++    f = self.simg_f
++    for s, e in ranges:
++      to_read = e-s
++      idx = bisect.bisect_right(self.offset_index, s) - 1
++      chunk_start, chunk_len, filepos = self.offset_map[idx]
++
++      # for the first chunk we may be starting partway through it.
++      p = filepos + ((s - chunk_start) * self.blocksize)
++      remain = chunk_len - (s - chunk_start)
++
++      f.seek(p, os.SEEK_SET)
++      this_read = min(remain, to_read)
++      yield f.read(this_read * self.blocksize)
++      to_read -= this_read
++
++      while to_read > 0:
++        # continue with following chunks if this range spans multiple chunks.
++        idx += 1
++        chunk_start, chunk_len, filepos = self.offset_map[idx]
++        f.seek(filepos, os.SEEK_SET)
++        this_read = min(chunk_len, to_read)
++        yield f.read(this_read * self.blocksize)
++        to_read -= this_read
++
++  def LoadFileBlockMap(self, fn):
++    remaining = self.care_map
++    self.file_map = out = {}
++
++    with open(fn) as f:
++      for line in f:
++        fn, ranges = line.split(None, 1)
++        ranges = RangeSet.parse(ranges)
++        out[fn] = ranges
++        assert ranges.size() == ranges.intersect(remaining).size()
++        remaining = remaining.subtract(ranges)
++
++    # For all the remaining blocks in the care_map (ie, those that
++    # aren't part of the data for any file), divide them into blocks
++    # that are all zero and blocks that aren't.  (Zero blocks are
++    # handled specially because (1) there are usually a lot of them
++    # and (2) bsdiff handles files with long sequences of repeated
++    # bytes especially poorly.)
++
++    zero_blocks = []
++    nonzero_blocks = []
++    reference = '\0' * self.blocksize
++
++    f = self.simg_f
++    for s, e in remaining:
++      for b in range(s, e):
++        idx = bisect.bisect_right(self.offset_index, b) - 1
++        chunk_start, chunk_len, filepos = self.offset_map[idx]
++        filepos += (b-chunk_start) * self.blocksize
++        f.seek(filepos, os.SEEK_SET)
++        data = f.read(self.blocksize)
++
++        if data == reference:
++          zero_blocks.append(b)
++          zero_blocks.append(b+1)
++        else:
++          nonzero_blocks.append(b)
++          nonzero_blocks.append(b+1)
++
++    out["__ZERO"] = RangeSet(data=zero_blocks)
++    out["__NONZERO"] = RangeSet(data=nonzero_blocks)
++
++  def ResetFileMap(self):
++    """Throw away the file map and treat the entire image as
++    undifferentiated data."""
++    self.file_map = {"__DATA": self.care_map}

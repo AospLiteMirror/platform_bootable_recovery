@@ -1,0 +1,27 @@
+From d07bfc519673fdba66448f0a81ef869b922c3804 Mon Sep 17 00:00:00 2001
+From: Tao Bao <tbao@google.com>
+Date: Sun, 12 Jul 2015 23:45:24 -0700
+Subject: Temporarily use blockimgdiff v2 for OTA.
+
+angler and bullhead have smaller cache partiton (~100MB) and hit issue
+with incremental OTA (such as MDA09B to MDA12) that requires more stash
+space with BBOTA v3. Temporarily use v2 as a workaround, until we come
+up with a real fix. Note that BBOTA v2 still uses some stash space, but
+should be much smaller than v3.
+
+Bug: 22430577
+Change-Id: Ic4c05f3609732e7d5140703062da9fe11df5c6d3
+
+diff --git a/core/Makefile b/core/Makefile
+index 7da3b2355..c98df0cf2 100644
+--- a/core/Makefile
++++ b/core/Makefile
+@@ -1507,7 +1507,7 @@ endif
+ 	$(hide) echo "use_set_metadata=1" >> $(zip_root)/META/misc_info.txt
+ 	$(hide) echo "multistage_support=1" >> $(zip_root)/META/misc_info.txt
+ 	$(hide) echo "update_rename_support=1" >> $(zip_root)/META/misc_info.txt
+-	$(hide) echo "blockimgdiff_versions=1,2,3" >> $(zip_root)/META/misc_info.txt
++	$(hide) echo "blockimgdiff_versions=1,2" >> $(zip_root)/META/misc_info.txt
+ ifneq ($(OEM_THUMBPRINT_PROPERTIES),)
+ 	# OTA scripts are only interested in fingerprint related properties
+ 	$(hide) echo "oem_fingerprint_properties=$(OEM_THUMBPRINT_PROPERTIES)" >> $(zip_root)/META/misc_info.txt
