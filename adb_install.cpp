@@ -85,7 +85,9 @@ apply_from_adb(RecoveryUI* ui_, int* wipe_cache, const char* install_file) {
               "to the device with \"adb sideload <filename>\"...\n");
 
     pid_t child;
+    //对子进程fork返回0给它，子进程随时可调用getpid()来获取自己的pid
     if ((child = fork()) == 0) {
+        //执行/sbin/recovery,传递的参数为"recovery", "--adbd",execl()其中后缀"l"代表list也就是参数列表的意思，第一参数path字符指针所指向要执行的文件路径， 接下来的参数代表执行该文件时传递的参数列表：argv[0],argv[1]... 最后一个参数须用空指针NULL作结束
         execl("/sbin/recovery", "recovery", "--adbd", NULL);
         _exit(-1);
     }

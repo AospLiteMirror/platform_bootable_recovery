@@ -299,6 +299,7 @@ typedef  pthread_mutex_t          adb_mutex_t;
 
 static __inline__ void  close_on_exec(int  fd)
 {
+    //fcntl如果对描述符设置了FD_CLOEXEC标志,使用execl执行的程序里，此描述符被关闭，不能再使用它，但是在使用fork调用的子进程中，此描述符并不关闭，仍可使用
     fcntl( fd, F_SETFD, FD_CLOEXEC );
 }
 
@@ -439,6 +440,8 @@ static __inline__ void  disable_tcp_nagle(int fd)
 
 static __inline__ int  unix_socketpair( int  d, int  type, int  protocol, int sv[2] )
 {
+    //Linux环境下使用socketpair函数创造一对未命名的、相互连接的UNIX域套接字
+    //参数sv[2]是代表两个套接口的整数数组
     return socketpair( d, type, protocol, sv );
 }
 
@@ -446,6 +449,11 @@ static __inline__ int  adb_socketpair( int  sv[2] )
 {
     int  rc;
 
+    //SOCK_STREAM即tcp协议,是有保障的(即能保证数据正确传送到对方)面向连接的SOCKET,多用于资料(如文件)传送
+    //AF_UNIX典型的本地IPC，类似于管道，依赖路径名标识发送方和接收方。即发送数据时，指定接收方绑定的路径名，
+    //操作系统根据该路径名可以直接找到对应的接收方，并将原始数据直接拷贝到接收方的内核缓冲区中，并上报给接收方进程进行处理。
+    //同样的接收方可以从收到的数据包中获取到发送方的路径名，并通过此路径名向其发送数据。
+    //AF_UNIX数据到达内核缓冲区后，由内核根据指定路径名找到接收方socket对应的内核缓冲区，直接将数据拷贝过去，不经过协议层编解码，节省系统cpu，并且不经过网卡，因此不受网卡带宽的限制
     rc = unix_socketpair( AF_UNIX, SOCK_STREAM, 0, sv );
     if (rc < 0)
         return -1;

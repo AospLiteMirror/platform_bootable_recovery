@@ -516,9 +516,12 @@ void init_transport_registration(void)
         fatal_errno("cannot open transport registration socketpair");
     }
 
+    //s[0]和s[1]为socketpair创建的那对套接字,transport_registration_send和transport_registration_recv都是处置值为-1的全局int变量
     transport_registration_send = s[0];
     transport_registration_recv = s[1];
 
+    //执行后fdevent结构体transport_registration_fde的fd=transport_registration_recv,func=transport_registration_func
+    //transport_registration_fde的state= FDE_ACTIVE | FDE_ACTIVE
     fdevent_install(&transport_registration_fde,
                     transport_registration_recv,
                     transport_registration_func,
