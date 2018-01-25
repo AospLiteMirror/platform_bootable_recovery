@@ -396,6 +396,9 @@ Value* RenameFn(const char* name, State* state, int argc, Expr* argv[]) {
         ErrorAbort(state, "Creating parent of %s failed, error %s",
           dst_name, strerror(errno));
     } else if (access(dst_name, F_OK) == 0 && access(src_name, F_OK) != 0) {
+        // 新路径下的文件存在,源路径下的文件不存在,认为这种情况是文件已经移动了
+        // Treat already-renamed files as having no problems.This should help with reentrant OTAs.
+        // Bug: 18079773
         // File was already moved
         result = dst_name;
     } else if (rename(src_name, dst_name) != 0) {
