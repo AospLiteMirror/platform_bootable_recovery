@@ -696,6 +696,7 @@ static void file_to_ui(const char* fn) {
     fclose(fp);
 }
 
+// 选择"view recovery logs"执行的函数
 static void choose_recovery_file(Device* device) {
     int i;
     static const char** title_headers = NULL;
@@ -829,6 +830,7 @@ prompt_and_wait(Device* device, int status) {
                 ui->Print("\nAPPLY_CACHE is deprecated.\n");
                 break;
 
+            // 如果选择的是"view recovery logs"
             case Device::READ_RECOVERY_LASTLOG:
                 choose_recovery_file(device);
                 break;

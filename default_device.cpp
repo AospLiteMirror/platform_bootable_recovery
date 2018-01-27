@@ -20,11 +20,13 @@
 #include "device.h"
 #include "screen_ui.h"
 
+// HEADERS就是recovery首页上方提示文字
 static const char* HEADERS[] = { "Volume up/down to move highlight;",
                                  "enter button to select.",
                                  "",
                                  NULL };
 
+// ITEMS中的文字就是recovery的首页各菜单项
 static const char* ITEMS[] =  {"reboot system now",
                                "apply update from ADB",
                                "wipe data/factory reset",
