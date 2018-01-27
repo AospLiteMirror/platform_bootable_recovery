@@ -93,6 +93,10 @@ char* PrintSha1(const uint8_t* digest) {
 //    fs_type="ext4"   partition_type="EMMC"    location=device
 Value* MountFn(const char* name, State* state, int argc, Expr* argv[]) {
     char* result = NULL;
+    //Allow passing of mount args to mountFn, Bug: 18079773 Bug: 18092222
+    //if (argc != 4) {
+    //    return ErrorAbort(state, "%s() expects 4 args, got %d", name, argc);
+    //}
     if (argc != 4 && argc != 5) {
         return ErrorAbort(state, "%s() expects 4-5 args, got %d", name, argc);
     }
@@ -100,15 +104,19 @@ Value* MountFn(const char* name, State* state, int argc, Expr* argv[]) {
     char* partition_type;
     char* location;
     char* mount_point;
+    // Allow passing of mount args to mountFn, Bug: 18079773 Bug: 18092222
+    // mount_options保存挂载参数
     char* mount_options;
     bool has_mount_options;
     if (argc == 5) {
+        //有挂载参数
         has_mount_options = true;
         if (ReadArgs(state, argv, 5, &fs_type, &partition_type,
                  &location, &mount_point, &mount_options) < 0) {
             return NULL;
         }
     } else {
+        //没有挂载参数
         has_mount_options = false;
         if (ReadArgs(state, argv, 4, &fs_type, &partition_type,
                  &location, &mount_point) < 0) {
@@ -167,6 +175,8 @@ Value* MountFn(const char* name, State* state, int argc, Expr* argv[]) {
         result = mount_point;
     } else {
         if (mount(location, mount_point, fs_type,
+                  // Allow passing of mount args to mountFn, Bug: 18079773 Bug: 18092222
+                  // -MS_NOATIME | MS_NODEV | MS_NODIRATIME, "") < 0) {
                   MS_NOATIME | MS_NODEV | MS_NODIRATIME,
                   has_mount_options ? mount_options : "") < 0) {
             uiPrintf(state, "%s: failed to mount %s at %s: %s\n",
