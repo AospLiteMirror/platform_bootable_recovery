@@ -52,6 +52,7 @@
 #include "wipe.h"
 #endif
 
+// State * state Log to UI any metadata setting errors Bug: 18079773
 void uiPrint(State* state, char* buffer) {
     char* line = strtok(buffer, "\n");
     UpdaterInfo* ui = (UpdaterInfo*)(state->cookie);
@@ -62,6 +63,7 @@ void uiPrint(State* state, char* buffer) {
     fprintf(ui->cmd_pipe, "ui_print\n");
 }
 
+// State * state Log to UI any metadata setting errors Bug: 18079773
 __attribute__((__format__(printf, 2, 3))) __nonnull((2))
 void uiPrintf(State* state, const char* format, ...) {
     char error_msg[1024];
@@ -708,6 +710,7 @@ static struct perm_parsed_args ParsePermArgs(State * state, int argc, char** arg
                 parsed.uid = uid;
                 parsed.has_uid = true;
             } else {
+                //Log to UI any metadata setting errors Bug: 18079773
                 uiPrintf(state, "ParsePermArgs: invalid UID \"%s\"\n", args[i + 1]);
                 bad++;
             }
@@ -719,6 +722,7 @@ static struct perm_parsed_args ParsePermArgs(State * state, int argc, char** arg
                 parsed.gid = gid;
                 parsed.has_gid = true;
             } else {
+                //Log to UI any metadata setting errors Bug: 18079773
                 uiPrintf(state, "ParsePermArgs: invalid GID \"%s\"\n", args[i + 1]);
                 bad++;
             }
@@ -730,6 +734,7 @@ static struct perm_parsed_args ParsePermArgs(State * state, int argc, char** arg
                 parsed.mode = mode;
                 parsed.has_mode = true;
             } else {
+                //Log to UI any metadata setting errors Bug: 18079773
                 uiPrintf(state, "ParsePermArgs: invalid mode \"%s\"\n", args[i + 1]);
                 bad++;
             }
@@ -741,6 +746,7 @@ static struct perm_parsed_args ParsePermArgs(State * state, int argc, char** arg
                 parsed.dmode = mode;
                 parsed.has_dmode = true;
             } else {
+                //Log to UI any metadata setting errors Bug: 18079773
                 uiPrintf(state, "ParsePermArgs: invalid dmode \"%s\"\n", args[i + 1]);
                 bad++;
             }
@@ -763,6 +769,7 @@ static struct perm_parsed_args ParsePermArgs(State * state, int argc, char** arg
                 parsed.capabilities = capabilities;
                 parsed.has_capabilities = true;
             } else {
+                //Log to UI any metadata setting errors Bug: 18079773
                 uiPrintf(state, "ParsePermArgs: invalid capabilities \"%s\"\n", args[i + 1]);
                 bad++;
             }
@@ -773,6 +780,7 @@ static struct perm_parsed_args ParsePermArgs(State * state, int argc, char** arg
                 parsed.selabel = args[i+1];
                 parsed.has_selabel = true;
             } else {
+                //Log to UI any metadata setting errors Bug: 18079773
                 uiPrintf(state, "ParsePermArgs: invalid selabel \"%s\"\n", args[i + 1]);
                 bad++;
             }
@@ -790,6 +798,7 @@ static struct perm_parsed_args ParsePermArgs(State * state, int argc, char** arg
 }
 
 static int ApplyParsedPerms(
+        // State * state: Log to UI any metadata setting errors Bug: 18079773
         State * state,
         const char* filename,
         const struct stat *statptr,
@@ -812,6 +821,7 @@ static int ApplyParsedPerms(
 
     if (parsed.has_uid) {
         if (chown(filename, parsed.uid, -1) < 0) {
+            // State * state Log to UI any metadata setting errors Bug: 18079773
             uiPrintf(state, "ApplyParsedPerms: chown of %s to %d failed: %s\n",
                     filename, parsed.uid, strerror(errno));
             bad++;
@@ -820,6 +830,7 @@ static int ApplyParsedPerms(
 
     if (parsed.has_gid) {
         if (chown(filename, -1, parsed.gid) < 0) {
+            // State * state Log to UI any metadata setting errors Bug: 18079773
             uiPrintf(state, "ApplyParsedPerms: chgrp of %s to %d failed: %s\n",
                     filename, parsed.gid, strerror(errno));
             bad++;
@@ -828,6 +839,7 @@ static int ApplyParsedPerms(
 
     if (parsed.has_mode) {
         if (chmod(filename, parsed.mode) < 0) {
+            // State * state Log to UI any metadata setting errors Bug: 18079773
             uiPrintf(state, "ApplyParsedPerms: chmod of %s to %d failed: %s\n",
                     filename, parsed.mode, strerror(errno));
             bad++;
@@ -836,6 +848,7 @@ static int ApplyParsedPerms(
 
     if (parsed.has_dmode && S_ISDIR(statptr->st_mode)) {
         if (chmod(filename, parsed.dmode) < 0) {
+            // State * state Log to UI any metadata setting errors Bug: 18079773
             uiPrintf(state, "ApplyParsedPerms: chmod of %s to %d failed: %s\n",
                     filename, parsed.dmode, strerror(errno));
             bad++;
@@ -844,6 +857,7 @@ static int ApplyParsedPerms(
 
     if (parsed.has_fmode && S_ISREG(statptr->st_mode)) {
         if (chmod(filename, parsed.fmode) < 0) {
+            // State * state Log to UI any metadata setting errors Bug: 18079773
             uiPrintf(state, "ApplyParsedPerms: chmod of %s to %d failed: %s\n",
                    filename, parsed.fmode, strerror(errno));
             bad++;
@@ -1290,6 +1304,7 @@ Value* UIPrintFn(const char* name, State* state, int argc, Expr* argv[]) {
     }
     free(args);
     buffer[size] = '\0';
+    // State * state Log to UI any metadata setting errors Bug: 18079773
     uiPrint(state, buffer);
     return StringValue(buffer);
 }
