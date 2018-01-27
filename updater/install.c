@@ -816,6 +816,8 @@ static int ApplyParsedPerms(
 {
     int bad = 0;
 
+    // unconditionally apply SELinux labels to symlinks
+    // 符号链接文件也必须更新selinux标签,跟新的是自身的,不是自身指向的文件
     if (parsed.has_selabel) {
         if (lsetfilecon(filename, parsed.selabel) != 0) {
             uiPrintf(state, "ApplyParsedPerms: lsetfilecon of %s to %s failed: %s\n",
@@ -825,6 +827,8 @@ static int ApplyParsedPerms(
     }
 
     /* ignore symlinks */
+    // 对于符号链接文件,在这里直接返回,后面的uid,gid等都不会更新
+    // 普通文件这里不返回,继续更新uid等
     if (S_ISLNK(statptr->st_mode)) {
         return bad;
     }
@@ -873,6 +877,17 @@ static int ApplyParsedPerms(
             bad++;
         }
     }
+
+	//drop the ENOTSUP special case. SELinux has been a requirement since Android 4.4. 
+	//Running without filesystem extended attributes is no longer supported,
+	//-	 if (parsed.has_selabel) {
+	//-		 // TODO: Don't silently ignore ENOTSUP
+	//-		 if (lsetfilecon(filename, parsed.selabel) && (errno != ENOTSUP)) {
+	//-			 uiPrintf(state, "ApplyParsedPerms: lsetfilecon of %s to %s failed: %s\n",
+	//-					 filename, parsed.selabel, strerror(errno));
+	//-			 bad++;
+	//-		 }
+	//-	 }
 
     if (parsed.has_capabilities && S_ISREG(statptr->st_mode)) {
         if (parsed.capabilities == 0) {
