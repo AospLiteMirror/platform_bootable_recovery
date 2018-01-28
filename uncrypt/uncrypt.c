@@ -167,7 +167,16 @@ char* parse_recovery_command_file()
     }
     //Force write to disk while doing uncrypt
     //FILE* fo = fopen(RECOVERY_COMMAND_FILE_TMP, "w");
-    int fd = open(RECOVERY_COMMAND_FILE_TMP, O_WRONLY | O_SYNC);
+    //Factory reset fails if there is no file, for example, RECOVERY_COMMAND_FILE_TMP.
+    //So create file as adding O_CREAT option if it does not exist.
+    //int fd = open(RECOVERY_COMMAND_FILE_TMP, O_WRONLY | O_SYNC);
+    int fd = open(RECOVERY_COMMAND_FILE_TMP, O_WRONLY | O_CREAT | O_SYNC, S_IRUSR | S_IWUSR);
+	int fd = open(RECOVERY_COMMAND_FILE_TMP, O_WRONLY | O_CREAT | O_SYNC, S_IRUSR | S_IWUSR);
+	if (fd < 0) {
+		ALOGE("failed to open %s\n", RECOVERY_COMMAND_FILE_TMP);
+		return NULL;
+	}
+
     FILE* fo = fdopen(fd, "w");
 
     while (fgets(temp, sizeof(temp), f)) {
@@ -196,7 +205,15 @@ int produce_block_map(const char* path, const char* map_file, const char* blk_de
     int ret;
 
     //Force write to disk while doing uncrypt
-    int mapfd = open(map_file, O_WRONLY | O_SYNC);
+    //int mapfd = open(map_file, O_WRONLY | O_SYNC);
+	//Factory reset fails if there is no file, for example, RECOVERY_COMMAND_FILE_TMP.
+	//So create file as adding O_CREAT option if it does not exist.
+	int mapfd = open(map_file, O_WRONLY | O_CREAT | O_SYNC, S_IRUSR | S_IWUSR);
+	if (mapfd < 0) {
+		ALOGE("failed to open %s\n", map_file);
+		return -1;
+	}
+
     FILE* mapf = fdopen(mapfd, "w");
 
     ret = stat(path, &sb);
