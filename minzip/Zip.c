@@ -1083,6 +1083,7 @@ bool mzExtractRecursive(const ZipArchive *pArchive,
                     setfscreatecon(secontext);
                 }
 
+                
                 int fd = open(targetFile, O_CREAT|O_WRONLY|O_TRUNC|O_SYNC
                         , UNZIP_FILEMODE);
 
@@ -1099,6 +1100,7 @@ bool mzExtractRecursive(const ZipArchive *pArchive,
                 }
 
                 bool ok = mzExtractZipEntryToFile(pArchive, pEntry, fd);
+                
                 if (ok) {
                     ok = (fsync(fd) == 0);
                 }

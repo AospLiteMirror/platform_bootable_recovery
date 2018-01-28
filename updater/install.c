@@ -161,12 +161,14 @@ Value* MountFn(const char* name, State* state, int argc, Expr* argv[]) {
         const MtdPartition* mtd;
         mtd = mtd_find_partition_by_name(location);
         if (mtd == NULL) {
+            // Log mount/unmount errors to UI
             uiPrintf(state, "%s: no mtd partition named \"%s\"",
                     name, location);
             result = strdup("");
             goto done;
         }
         if (mtd_mount_partition(mtd, mount_point, fs_type, 0 /* rw */) != 0) {
+            // Log mount/unmount errors to UI
             uiPrintf(state, "mtd mount of %s failed: %s\n",
                     location, strerror(errno));
             result = strdup("");
@@ -179,6 +181,7 @@ Value* MountFn(const char* name, State* state, int argc, Expr* argv[]) {
                   // -MS_NOATIME | MS_NODEV | MS_NODIRATIME, "") < 0) {
                   MS_NOATIME | MS_NODEV | MS_NODIRATIME,
                   has_mount_options ? mount_options : "") < 0) {
+            // Log mount/unmount errors to UI
             uiPrintf(state, "%s: failed to mount %s at %s: %s\n",
                     name, location, mount_point, strerror(errno));
             result = strdup("");
@@ -243,11 +246,13 @@ Value* UnmountFn(const char* name, State* state, int argc, Expr* argv[]) {
     scan_mounted_volumes();
     const MountedVolume* vol = find_mounted_volume_by_mount_point(mount_point);
     if (vol == NULL) {
+        // Log mount/unmount errors to UI
         uiPrintf(state, "unmount of %s failed; no such volume\n", mount_point);
         result = strdup("");
     } else {
         int ret = unmount_mounted_volume(vol);
         if (ret != 0) {
+           // Log mount/unmount errors to UI
            uiPrintf(state, "unmount of %s failed (%d): %s\n",
                     mount_point, ret, strerror(errno));
         }
