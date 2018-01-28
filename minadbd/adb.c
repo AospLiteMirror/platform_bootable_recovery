@@ -387,7 +387,7 @@ int adb_main()
 		 * HAVE_FORKEXEC - use fork() and exec()
 		 * HAVE_WIN32_PROC - use CreateProcess()
 		 */
-#if defined(HAVE_FORKEXEC)
+#if !defined(_WIN32)
     // No SIGCHLD. Let the service subproc handle its children.
     signal(SIGPIPE, SIG_IGN);
 #endif
