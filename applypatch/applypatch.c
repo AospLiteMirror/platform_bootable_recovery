@@ -310,6 +310,12 @@ static int LoadPartitionContents(const char* filename, FileContents* file) {
 // Save the contents of the given FileContents object under the given
 // filename.  Return 0 on success.
 int SaveFileContents(const char* filename, const FileContents* file) {
+    //Use more aggressive sync writing to applypatch.
+    //We have seen cases where the boot partition is patched, but upon
+    //recovery the partition appears to be corrupted.  Open up all
+    //patched files/partitions with O_SYNC, and do not ignore the
+    //errors from fsync/close operations.
+    // -int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
     int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC | O_SYNC, S_IRUSR | S_IWUSR);
     if (fd < 0) {
         printf("failed to open \"%s\" for write: %s\n",
@@ -415,6 +421,12 @@ int WriteToPartition(unsigned char* data, size_t len,
         {
             size_t start = 0;
             int success = 0;
+            //Use more aggressive sync writing to applypatch.
+            //We have seen cases where the boot partition is patched, but upon
+            //recovery the partition appears to be corrupted.  Open up all
+            //patched files/partitions with O_SYNC, and do not ignore the
+            //errors from fsync/close operations.
+            // -int fd = open(partition, O_RDWR);
             int fd = open(partition, O_RDWR | O_SYNC);
             if (fd < 0) {
                 printf("failed to open %s: %s\n", partition, strerror(errno));
@@ -982,6 +994,7 @@ static int GenerateTarget(FileContents* source_file,
             strcpy(outname, target_filename);
             strcat(outname, ".patch");
 
+            //Use more aggressive sync writing to applypatch.
             output = open(outname, O_WRONLY | O_CREAT | O_TRUNC | O_SYNC,
                 S_IRUSR | S_IWUSR);
             if (output < 0) {
