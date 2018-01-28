@@ -1083,7 +1083,8 @@ bool mzExtractRecursive(const ZipArchive *pArchive,
                     setfscreatecon(secontext);
                 }
 
-                
+                //Force sync files written by minzip.Some files appear to be missing their sync to disk. Bug: 18145574
+                // -int fd = creat(targetFile, UNZIP_FILEMODE);
                 int fd = open(targetFile, O_CREAT|O_WRONLY|O_TRUNC|O_SYNC
                         , UNZIP_FILEMODE);
 
@@ -1100,7 +1101,8 @@ bool mzExtractRecursive(const ZipArchive *pArchive,
                 }
 
                 bool ok = mzExtractZipEntryToFile(pArchive, pEntry, fd);
-                
+                //Force sync files written by minzip.Some files appear to be missing their sync to disk. Bug: 18145574
+                // -close(fd)
                 if (ok) {
                     ok = (fsync(fd) == 0);
                 }
