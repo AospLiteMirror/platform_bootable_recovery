@@ -30,6 +30,11 @@ on init
     chmod 0775 /tmp
 
     write /proc/sys/kernel/panic_on_oops 1
+    #/proc/sys/vm 该目录下的文件用来优化虚拟内存
+    //max_map_count一个进程最多可用于的内存映射区(memory map areas)，在调用malloc会用到，由mmap/mprotect生成
+    //Memory map areas are used as a side-effect of calling malloc, directly by mmap and mprotect, and also when loading shared libraries.
+    //大部分程序使用数量不会超过1000，默认值65536
+    //注：该值若太小某些情况下会导致ora-4030，详情参照ID 1325100.1
     write /proc/sys/vm/max_map_count 1000000
 
 on fs
