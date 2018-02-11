@@ -1,0 +1,245 @@
+From dd67a295cc91ad636b81b705b5bedda945035568 Mon Sep 17 00:00:00 2001
+From: Sami Tolvanen <samitolvanen@google.com>
+Date: Tue, 9 Dec 2014 16:40:34 +0000
+Subject: Change transfer list format to include block hashes
+
+Add source and target block hashes as parameters to transfer list
+commands that copy or patch data to a partition. This allows the
+updater to verify the status of each command in the transfer list
+and makes resuming block based OTAs possible. Due to the changes,
+update the transfer list version to 3.
+
+Needs matching changes from
+  I1e752464134aeb2d396946348e6041acabe13942
+
+Bug: 18262110
+Change-Id: Ia5c56379f570047f10f0aa7373a1025439495c98
+(cherry picked from commit cac671a9d175039ecbfe3cd84fe10b183aab1f8a)
+
+diff --git a/core/Makefile b/core/Makefile
+index 5fb366ac6..db0d4bf35 100644
+--- a/core/Makefile
++++ b/core/Makefile
+@@ -1417,7 +1417,7 @@ endif
+ 	$(hide) echo "use_set_metadata=1" >> $(zip_root)/META/misc_info.txt
+ 	$(hide) echo "multistage_support=1" >> $(zip_root)/META/misc_info.txt
+ 	$(hide) echo "update_rename_support=1" >> $(zip_root)/META/misc_info.txt
+-	$(hide) echo "blockimgdiff_versions=1,2" >> $(zip_root)/META/misc_info.txt
++	$(hide) echo "blockimgdiff_versions=1,2,3" >> $(zip_root)/META/misc_info.txt
+ ifneq ($(OEM_THUMBPRINT_PROPERTIES),)
+ 	# OTA scripts are only interested in fingerprint related properties
+ 	$(hide) echo "oem_fingerprint_properties=$(OEM_THUMBPRINT_PROPERTIES)" >> $(zip_root)/META/misc_info.txt
+diff --git a/tools/releasetools/blockimgdiff.py b/tools/releasetools/blockimgdiff.py
+index 8b179d5a3..0646c5fd8 100644
+--- a/tools/releasetools/blockimgdiff.py
++++ b/tools/releasetools/blockimgdiff.py
+@@ -190,14 +190,14 @@ class Transfer(object):
+ # original image.
+ 
+ class BlockImageDiff(object):
+-  def __init__(self, tgt, src=None, threads=None, version=2):
++  def __init__(self, tgt, src=None, threads=None, version=3):
+     if threads is None:
+       threads = multiprocessing.cpu_count() // 2
+       if threads == 0: threads = 1
+     self.threads = threads
+     self.version = version
+ 
+-    assert version in (1, 2)
++    assert version in (1, 2, 3)
+ 
+     self.tgt = tgt
+     if src is None:
+@@ -244,6 +244,15 @@ class BlockImageDiff(object):
+     self.ComputePatches(prefix)
+     self.WriteTransfers(prefix)
+ 
++  def HashBlocks(self, source, ranges):
++    data = source.ReadRangeSet(ranges)
++    ctx = sha1()
++
++    for p in data:
++      ctx.update(p)
++
++    return ctx.hexdigest()
++
+   def WriteTransfers(self, prefix):
+     out = []
+ 
+@@ -272,14 +281,22 @@ class BlockImageDiff(object):
+           next_stash_id += 1
+         stashes[s] = sid
+         stashed_blocks += sr.size()
+-        out.append("stash %d %s\n" % (sid, sr.to_string_raw()))
++        if self.version == 2:
++          out.append("stash %d %s\n" % (sid, sr.to_string_raw()))
++        else:
++          sh = self.HashBlocks(self.src, sr)
++          if sh in stashes:
++            stashes[sh] += 1
++          else:
++            stashes[sh] = 1
++            out.append("stash %s %s\n" % (sh, sr.to_string_raw()))
+ 
+       if stashed_blocks > max_stashed_blocks:
+         max_stashed_blocks = stashed_blocks
+ 
+       if self.version == 1:
+         src_string = xf.src_ranges.to_string_raw()
+-      elif self.version == 2:
++      elif self.version >= 2:
+ 
+         #   <# blocks> <src ranges>
+         #     OR
+@@ -289,6 +306,7 @@ class BlockImageDiff(object):
+ 
+         size = xf.src_ranges.size()
+         src_string = [str(size)]
++        free_string = []
+ 
+         unstashed_src_ranges = xf.src_ranges
+         mapped_stashes = []
+@@ -296,9 +314,18 @@ class BlockImageDiff(object):
+           sid = stashes.pop(s)
+           stashed_blocks -= sr.size()
+           unstashed_src_ranges = unstashed_src_ranges.subtract(sr)
++          sh = self.HashBlocks(self.src, sr)
+           sr = xf.src_ranges.map_within(sr)
+           mapped_stashes.append(sr)
+-          src_string.append("%d:%s" % (sid, sr.to_string_raw()))
++          if self.version == 2:
++            src_string.append("%d:%s" % (sid, sr.to_string_raw()))
++          else:
++            assert sh in stashes
++            src_string.append("%s:%s" % (sh, sr.to_string_raw()))
++            stashes[sh] -= 1
++            if stashes[sh] == 0:
++              free_string.append("free %s\n" % (sh))
++              stashes.pop(sh)
+           heapq.heappush(free_stash_ids, sid)
+ 
+         if unstashed_src_ranges:
+@@ -314,7 +341,7 @@ class BlockImageDiff(object):
+ 
+         src_string = " ".join(src_string)
+ 
+-      # both versions:
++      # all versions:
+       #   zero <rangeset>
+       #   new <rangeset>
+       #   erase <rangeset>
+@@ -328,6 +355,11 @@ class BlockImageDiff(object):
+       #   bsdiff patchstart patchlen <tgt rangeset> <src_string>
+       #   imgdiff patchstart patchlen <tgt rangeset> <src_string>
+       #   move <tgt rangeset> <src_string>
++      #
++      # version 3:
++      #   bsdiff patchstart patchlen srchash tgthash <tgt rangeset> <src_string>
++      #   imgdiff patchstart patchlen srchash tgthash <tgt rangeset> <src_string>
++      #   move hash <tgt rangeset> <src_string>
+ 
+       tgt_size = xf.tgt_ranges.size()
+ 
+@@ -348,6 +380,11 @@ class BlockImageDiff(object):
+             out.append("%s %s %s\n" % (
+                 xf.style,
+                 xf.tgt_ranges.to_string_raw(), src_string))
++          elif self.version >= 3:
++            out.append("%s %s %s %s\n" % (
++                xf.style,
++                self.HashBlocks(self.tgt, xf.tgt_ranges),
++                xf.tgt_ranges.to_string_raw(), src_string))
+           total += tgt_size
+       elif xf.style in ("bsdiff", "imgdiff"):
+         performs_read = True
+@@ -361,6 +398,13 @@ class BlockImageDiff(object):
+           out.append("%s %d %d %s %s\n" % (
+               xf.style, xf.patch_start, xf.patch_len,
+               xf.tgt_ranges.to_string_raw(), src_string))
++        elif self.version >= 3:
++          out.append("%s %d %d %s %s %s %s\n" % (
++              xf.style,
++              xf.patch_start, xf.patch_len,
++              self.HashBlocks(self.src, xf.src_ranges),
++              self.HashBlocks(self.tgt, xf.tgt_ranges),
++              xf.tgt_ranges.to_string_raw(), src_string))
+         total += tgt_size
+       elif xf.style == "zero":
+         assert xf.tgt_ranges
+@@ -371,6 +415,9 @@ class BlockImageDiff(object):
+       else:
+         raise ValueError, "unknown transfer style '%s'\n" % (xf.style,)
+ 
++      if free_string:
++        out.append("".join(free_string))
++
+ 
+       # sanity check: abort if we're going to need more than 512 MB if
+       # stash space
+diff --git a/tools/releasetools/common.py b/tools/releasetools/common.py
+index 8941f890f..14975d5dc 100644
+--- a/tools/releasetools/common.py
++++ b/tools/releasetools/common.py
+@@ -1056,18 +1056,21 @@ class BlockDifference:
+     self._WriteUpdate(script, output_zip)
+ 
+   def WriteVerifyScript(self, script):
++    partition = self.partition
+     if not self.src:
+-      script.Print("Image %s will be patched unconditionally." % (self.partition,))
++      script.Print("Image %s will be patched unconditionally." % (partition,))
+     else:
++      script.AppendExtra(('if block_image_verify("%s", '
++                          'package_extract_file("%s.transfer.list"), '
++                          '"%s.new.dat", "%s.patch.dat") then') %
++                         (self.device, partition, partition, partition))
++      script.Print("Verified %s image..." % (partition,))
++      script.AppendExtra('else');
++
+       if self.check_first_block:
+         self._CheckFirstBlock(script)
+ 
+-      script.AppendExtra('if range_sha1("%s", "%s") == "%s" then' %
+-                         (self.device, self.src.care_map.to_string_raw(),
+-                          self.src.TotalSha1()))
+-      script.Print("Verified %s image..." % (self.partition,))
+-      script.AppendExtra(('else\n'
+-                          '  (range_sha1("%s", "%s") == "%s") ||\n'
++      script.AppendExtra(('(range_sha1("%s", "%s") == "%s") ||\n'
+                           '  abort("%s partition has unexpected contents");\n'
+                           'endif;') %
+                          (self.device, self.tgt.care_map.to_string_raw(),
+@@ -1089,18 +1092,27 @@ class BlockDifference:
+             (self.device, partition, partition, partition))
+     script.AppendExtra(script._WordWrap(call))
+ 
++  def _HashBlocks(self, source, ranges):
++    data = source.ReadRangeSet(ranges)
++    ctx = sha1()
++
++    for p in data:
++      ctx.update(p)
++
++    return ctx.hexdigest()
++
+   def _CheckFirstBlock(self, script):
+     r = RangeSet((0, 1))
+-    h = sha1()
+-    for data in self.src.ReadRangeSet(r):
+-      h.update(data)
+-    h = h.hexdigest()
++    srchash = self._HashBlocks(self.src, r);
++    tgthash = self._HashBlocks(self.tgt, r);
+ 
+     script.AppendExtra(('(range_sha1("%s", "%s") == "%s") || '
++                        '(range_sha1("%s", "%s") == "%s") || '
+                         'abort("%s has been remounted R/W; '
+                         'reflash device to reenable OTA updates");')
+-                       % (self.device, r.to_string_raw(), h, self.device))
+-
++                       % (self.device, r.to_string_raw(), srchash,
++                          self.device, r.to_string_raw(), tgthash,
++                          self.device))
+ 
+ DataImage = blockimgdiff.DataImage
+ 

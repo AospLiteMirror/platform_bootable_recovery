@@ -1,0 +1,59 @@
+getprop("ro.product.device") == "bullhead" || abort("This package is for \"bullhead\" devices; this is a \"" + getprop("ro.product.device") + "\".");
+ui_print("Source: google/bullhead/bullhead:6.0.1/MHC19Q/2705526:user/release-keys");
+ui_print("Target: google/bullhead/bullhead:6.0.1/MTC19T/2741993:user/release-keys");
+ui_print("Verifying current system...");
+getprop("ro.build.fingerprint") == "google/bullhead/bullhead:6.0.1/MHC19Q/2705526:user/release-keys" ||
+    getprop("ro.build.fingerprint") == "google/bullhead/bullhead:6.0.1/MTC19T/2741993:user/release-keys" ||
+    abort("Package expects build fingerprint of google/bullhead/bullhead:6.0.1/MHC19Q/2705526:user/release-keys or google/bullhead/bullhead:6.0.1/MTC19T/2741993:user/release-keys; this device has " + getprop("ro.build.fingerprint") + ".");
+apply_patch_check("EMMC:/dev/block/platform/soc.0/f9824900.sdhci/by-name/boot:11793638:b2195a07c1ce9f03cb7bd9f46519e2c6eeca9d58:11793638:8be0c9aeb2daad85905004a1d1898ff701778022") || abort("\"EMMC:/dev/block/platform/soc.0/f9824900.sdhci/by-name/boot:11793638:b2195a07c1ce9f03cb7bd9f46519e2c6eeca9d58:11793638:8be0c9aeb2daad85905004a1d1898ff701778022\" has unexpected contents.");
+apply_patch_space(58120704) || abort("Not enough free space on /system to apply patches.");
+apply_patch_check("EMMC:/dev/block/platform/soc.0/f9824900.sdhci/by-name/modem:58120704:05de064cf0e0d13c58764581041455b6e709e0cf:58120704:c49fab8181db8449aa1ac2021f3c5a864a4d9e0e") || abort("\"EMMC:/dev/block/platform/soc.0/f9824900.sdhci/by-name/modem:58120704:05de064cf0e0d13c58764581041455b6e709e0cf:58120704:c49fab8181db8449aa1ac2021f3c5a864a4d9e0e\" has unexpected contents.");
+if (range_sha1("/dev/block/platform/soc.0/f9824900.sdhci/by-name/system", "86,1,32770,32961,32963,33471,65538,66046,98303,98304,98306,98497,98499,99007,131071,131072,131074,131582,163839,163840,163842,164033,164035,164543,196607,196608,196610,197118,229375,229376,229378,229569,229571,230079,262143,262144,262146,262654,294911,294912,294914,295105,295107,295615,327679,327680,327682,328190,360447,360448,360450,360958,393215,393216,393218,393726,425983,425984,425986,426494,458751,458752,458754,459262,465373,491520,491522,524288,524290,557056,557058,589824,589826,622592,622594,655360,655362,688128,688130,720896,720898,753664,753666,754174,780230,780231,786384") == "4521ed64455fb7c89f5d2be539dc457fa277e1d8" || block_image_verify("/dev/block/platform/soc.0/f9824900.sdhci/by-name/system", package_extract_file("system.transfer.list"), "system.new.dat", "system.patch.dat")) then
+ui_print("Verified system image...");
+else
+abort("system partition has unexpected contents");
+endif;
+if (range_sha1("/dev/block/platform/soc.0/f9824900.sdhci/by-name/vendor", "10,1,17482,32768,32770,32785,32787,33279,62960,62979,63485") == "157b3ad7da1260e3043f5f9e231aff7cd64efa73" || block_image_verify("/dev/block/platform/soc.0/f9824900.sdhci/by-name/vendor", package_extract_file("vendor.transfer.list"), "vendor.new.dat", "vendor.patch.dat")) then
+ui_print("Verified vendor image...");
+else
+abort("vendor partition has unexpected contents");
+endif;
+
+# ---- start making changes here ----
+
+ui_print("Patching system image after verification.");
+show_progress(0.800000, 0);
+block_image_update("/dev/block/platform/soc.0/f9824900.sdhci/by-name/system", package_extract_file("system.transfer.list"), "system.new.dat", "system.patch.dat");
+ui_print("Verifying the updated system image...");
+if range_sha1("/dev/block/platform/soc.0/f9824900.sdhci/by-name/system", "86,0,32770,32961,32963,33471,65538,66046,98303,98304,98306,98497,98499,99007,131071,131072,131074,131582,163839,163840,163842,164033,164035,164543,196607,196608,196610,197118,229375,229376,229378,229569,229571,230079,262143,262144,262146,262654,294911,294912,294914,295105,295107,295615,327679,327680,327682,328190,360447,360448,360450,360958,393207,393216,393218,393726,425983,425984,425986,426494,458751,458752,458754,459262,465371,491520,491522,524288,524290,557056,557058,589824,589826,622592,622594,655360,655362,688128,688130,720896,720898,753664,753666,754174,780230,780231,786384") == "802d9fb7ddc0681a96123847eb10e641d4ca4e1a" then
+if range_sha1("/dev/block/platform/soc.0/f9824900.sdhci/by-name/system", "102,32770,32961,32963,33471,65538,66046,98303,98304,98306,98497,98499,99007,131071,131072,131074,131582,163839,163840,163842,164033,164035,164543,196607,196608,196610,197118,229375,229376,229378,229569,229571,230079,262143,262144,262146,262654,294911,294912,294914,295105,295107,295615,327679,327680,327682,328190,360447,360448,360450,360958,393207,393216,393218,393726,425983,425984,425986,426494,458751,458752,458754,459262,465371,465883,491008,491520,491522,492034,523776,524288,524290,524802,556544,557056,557058,557570,589312,589824,589826,590338,622080,622592,622594,623106,654848,655360,655362,655874,687616,688128,688130,688642,720384,720896,720898,721410,753152,753664,753666,754174,780230,780231") == "10466270ef478c6c6b43e393173700e9990f495c" then
+ui_print("Verified the updated system image.");
+else
+  abort("system partition has unexpected non-zero contents after OTA update");
+endif;
+else
+  abort("system partition has unexpected contents after OTA update");
+endif;
+ui_print("Patching vendor image after verification.");
+show_progress(0.100000, 0);
+block_image_update("/dev/block/platform/soc.0/f9824900.sdhci/by-name/vendor", package_extract_file("vendor.transfer.list"), "vendor.new.dat", "vendor.patch.dat");
+ui_print("Verifying the updated vendor image...");
+if range_sha1("/dev/block/platform/soc.0/f9824900.sdhci/by-name/vendor", "10,0,17482,32768,32770,32785,32787,33279,62960,62979,63485") == "9c71d5095550abc2240dc740b38bc73bc8238c99" then
+if range_sha1("/dev/block/platform/soc.0/f9824900.sdhci/by-name/vendor", "10,17482,17994,32256,32768,32770,32785,32787,33279,62960,62979") == "bc9077c0654ff2f8d259ca5046484470f8557bc0" then
+ui_print("Verified the updated vendor image.");
+else
+  abort("vendor partition has unexpected non-zero contents after OTA update");
+endif;
+else
+  abort("vendor partition has unexpected contents after OTA update");
+endif;
+ui_print("Patching boot image...");
+show_progress(0.100000, 10);
+apply_patch("EMMC:/dev/block/platform/soc.0/f9824900.sdhci/by-name/boot:11793638:b2195a07c1ce9f03cb7bd9f46519e2c6eeca9d58:11793638:8be0c9aeb2daad85905004a1d1898ff701778022",
+            "-", 8be0c9aeb2daad85905004a1d1898ff701778022, 11793638,
+            b2195a07c1ce9f03cb7bd9f46519e2c6eeca9d58, package_extract_file("patch/boot.img.p"));
+ui_print("Patching radio...");
+apply_patch("EMMC:/dev/block/platform/soc.0/f9824900.sdhci/by-name/modem:58120704:05de064cf0e0d13c58764581041455b6e709e0cf:58120704:c49fab8181db8449aa1ac2021f3c5a864a4d9e0e",
+            "-", c49fab8181db8449aa1ac2021f3c5a864a4d9e0e, 58120704,
+            05de064cf0e0d13c58764581041455b6e709e0cf, package_extract_file("radio.img.p"));
+set_progress(1.000000);

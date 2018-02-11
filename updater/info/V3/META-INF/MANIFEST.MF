@@ -1,0 +1,36 @@
+Manifest-Version: 1.0
+Created-By: 1.0 (Android SignApk)
+
+Name: META-INF/com/google/android/updater-script
+SHA1-Digest: p1Uscycwya4pbiZqZDNsTRKSkRs=
+
+Name: system.new.dat
+SHA1-Digest: 7LtsAnHMwOT6Yzq+SNlbCPfugBo=
+
+Name: vendor.transfer.list
+SHA1-Digest: MV6oZjjDVXu2htzXuYcG0HkA944=
+
+Name: META-INF/com/google/android/update-binary
+SHA1-Digest: tVKHDTsBSQ3xiojl3D/NztvkSZ4=
+
+Name: META-INF/com/android/metadata
+SHA1-Digest: bH1HNolNlbZWNtO/xk30D2gcbvM=
+
+Name: vendor.patch.dat
+SHA1-Digest: 6ACsyMXITWxv/gTjPQ/s+JlUxvY=
+
+Name: system.patch.dat
+SHA1-Digest: vPKioprmdG3vqZeFGvLlty4R4bs=
+
+Name: vendor.new.dat
+SHA1-Digest: X01qu2kikJ2/vOzyrZ+GK3ZqEck=
+
+Name: radio.img.p
+SHA1-Digest: 8HtWTnyVDLcHPPJbtQnuiXWcodg=
+
+Name: system.transfer.list
+SHA1-Digest: HyXZHX1fvjvBoPW2RoGM5qnaCEM=
+
+Name: patch/boot.img.p
+SHA1-Digest: cnYjgF067mb0y/2LsKKY6ubPWno=
+

@@ -1,0 +1,5 @@
+ota-type=BLOCK
+post-build=google/bullhead/bullhead:6.0.1/MTC19T/2741993:user/release-keys
+post-timestamp=1459891230
+pre-build=google/bullhead/bullhead:6.0.1/MHC19Q/2705526:user/release-keys
+pre-device=bullhead

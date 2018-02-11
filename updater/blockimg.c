@@ -543,13 +543,187 @@ static void LoadSrcTgtVersion2(char* wordsave, RangeSet** tgt, int* src_blocks,
     }
 }
 
+// Parameters for transfer list command functions
+typedef struct {
+	char* cmdname;
+	char* cpos;
+	char* freestash;
+	char* stashbase;
+	int canwrite;
+	int createdstash;
+	int fd;
+	int foundwrites;
+	int isunresumable;
+	int version;
+	int written;
+	NewThreadInfo nti;
+	pthread_t thread;
+	size_t bufsize;
+	uint8_t* buffer;
+	uint8_t* patch_start;
+} CommandParameters;
+
+// Do a source/target load for move/bsdiff/imgdiff in version 3.
+//
+// Parameters are the same as for LoadSrcTgtVersion2, except for 'onehash', which
+// tells the function whether to expect separate source and targe block hashes, or
+// if they are both the same and only one hash should be expected, and
+// 'isunresumable', which receives a non-zero value if block verification fails in
+// a way that the update cannot be resumed anymore.
+// 参数与V2相同,除了"onehash",其用来 1 区别命令是否期待分隔的source和target block的hash,
+// 如果source和target block相同则"onehash"只有一个hash值,否则"onehash"有两个hash值.
+// 2 区别命令是否是"unresumable"(无法继续), 如果block验证失败会设置unresumable为一个非0值,
+// unresumable设置为非0代表在某种程度上更新就不能继续进行
+//
+// If the function is unable to load the necessary blocks or their contents don't
+// match the hashes, the return value is -1 and the command should be aborted.
+//
+// If the return value is 1, the command has already been completed according to
+// the contents of the target blocks, and should not be performed again.
+//
+// If the return value is 0, source blocks have expected content and the command
+// can be performed.
+
+static int LoadSrcTgtVersion3(CommandParameters* params, RangeSet** tgt, int* src_blocks,
+							  int onehash, int* overlap) {
+	char* srchash = NULL;
+	char* tgthash = NULL;
+	int overlap_blocks = 0;
+	int rc = -1;
+	uint8_t* tgtbuffer = NULL;
+
+	if (!params|| !tgt || !src_blocks || !overlap) {
+		goto v3out;
+	}
+
+    // 对于bsdiff/imgdiff, params->cpos指向的就是bsdiff/imgdiff <patchstart> <patchlen> <...>的<...>
+    // 对于move,params->cpos指向的就是move <...>的<...>
+	srchash = strtok_r(NULL, " ", &params->cpos);
+
+	if (srchash == NULL) {
+		fprintf(stderr, "missing source hash\n");
+		goto v3out;
+	}
+
+    // 对于bsdiff/imgdiff,调用LoadSrcTgtVersion3时onehash为0
+    // 对于move,调用LoadSrcTgtVersion3时onehash为1
+	if (onehash) {
+	    //如果onehash为0,说明tgt与src block数据相同
+		tgthash = srchash;
+	} else {
+	    // 如果onehash不为0,说明另存在tgthash
+		tgthash = strtok_r(NULL, " ", &params->cpos);
+
+		if (tgthash == NULL) {
+			fprintf(stderr, "missing target hash\n");
+			goto v3out;
+		}
+	}
+
+    //因为所有hash解析完后,命令中剩下的参数对于V3和V2都是完全一样的格式了,因此下来可以调用LoadSrcTgtVersion2来完成加载
+	if (LoadSrcTgtVersion2(&params->cpos, tgt, src_blocks, &params->buffer, &params->bufsize,
+			params->fd, params->stashbase, overlap) == -1) {
+		goto v3out;
+	}
+
+    //在LoadSrcTgtVersion2中解析target rangeset,将相关信息保存到tgt中,这里根据tgt的大小分配buffer
+	tgtbuffer = (uint8_t*) malloc((*tgt)->size * BLOCKSIZE);
+
+	if (tgtbuffer == NULL) {
+		fprintf(stderr, "failed to allocate %d bytes\n", (*tgt)->size * BLOCKSIZE);
+		goto v3out;
+	}
+
+    //根据tgt中包含的位置信息,从脚本中block_image_verify的第一个参数(/dev/block/bootdevice/by-name/system)读取对应位置数据到buffer中
+    // 加载tgt block数据到tgtbuffer
+	if (ReadBlocks(*tgt, tgtbuffer, params->fd) == -1) {
+		goto v3out;
+	}
+
+    // 验证tgt block数据的sha1是否等于tgthash
+	if (VerifyBlocks(tgthash, tgtbuffer, (*tgt)->size, 0) == 0) {
+		// Target blocks already have expected content, command should be skipped
+		// 如果tgt block数据的sha1等于tgthash,说明调用LoadSrcTgtVersion3的命令之前成功过
+		// 因此可以直接设置返回值为1并跳过最后.这种情况很可能是升级过程中重启后才能遇到
+		// 返回1代表按照tgt block的内容命令已经执行过了,而且不应该再次执行
+		rc = 1;
+		goto v3out;
+	}
+
+    // 如果tgt block数据的sha1不等于tgthash,再验证src block数据的sha1是否等于srchash
+    // 能执行到这里要么是没有重启第一次刚执行调用V3的命令,要么是升级过程中强制重启,重启前tgt写到一半,重启后检测到tgt与tgthash不匹配
+    // 在调用LoadSrcTgtVersion2时已经从source或(和)stash中读取数据到了params->buffer中,这里就可以验证与src hash是否匹配
+	if (VerifyBlocks(srchash, params->buffer, *src_blocks, 1) == 0) {
+	    // 执行到这里说明从block_image_verify第一个参数读取到的target与tgt hash不匹配, 但
+        // 从source或(和)stash中读取的数据(params->buffer)与src hash匹配, 这时再看source blocks和target blocks是否有重叠,
+        // 如果有重叠,根据逻辑,因为要读的所有数据已经保存在了params->buffer中,所以还要调用WriteStash把params->buffer(其中保存了这段src blocks)全部再写入到/cache/recovery/{stashbase}/{srchash}这个文件中去. 
+        // 写入的大小就是LoadSrcTgtVersion2中计算得到的src_blocks
+		// If source and target blocks overlap, stash the source blocks so we can
+		// resume from possible write errors
+		if (*overlap) {
+		    //如果source blocks和target blocks有重叠,
+			fprintf(stderr, "stashing %d overlapping blocks to %s\n", *src_blocks,
+				srchash);
+
+			if (WriteStash(params->stashbase, srchash, *src_blocks, params->buffer, 1) != 0) {
+				fprintf(stderr, "failed to stash overlapping source blocks\n");
+				goto v3out;
+			}
+
+			// Can be deleted when the write has completed
+			if (!stash_exists) { 
+			    //在WriteStash写入成功后可以将srchash保存到params->freestash中
+			    params->freestash = srchash;
+			}
+		}
+
+        // 不管有没有重叠,这种情况都说明Source blocks have expected content, 到这里就可以跳到函数最后并返回0
+        // 函数返回0代表source blocks与期待的匹配,命令可以执行
+        // 正常升级没有任何中断重启的情况下,第一次执行的命令都是走到这里
+		// Source blocks have expected content, command can proceed
+		rc = 0;
+		goto v3out;
+	}
+
+    // 执行到这里说明从block_image_verify第一个参数读取到的target与tgt hash不匹配, 同时从source或(和)stash中读取的数据(params->buffer)与src hash也不匹配
+    // 这种情况下, 如果source blocks和target blocks有重叠,重叠的source blocks在之前会被暂存, 这时就可以调用LoadStash把之前暂停的stash文件(/cache/recovery/{stashbase}/{srchash})读取到params->buffer中.
+    // 如果执行transfer.list中的命令时突然手机重启,重启后恢复更新就会走到这一步, 这种情况下无法判断stash是否可以删除
+	if (*overlap && LoadStash(params->stashbase, srchash, 1, NULL, &params->buffer,
+						&params->bufsize, 1) == 0) {
+		// 如果LoadStash读取成功,到这里就可以跳到函数最后并返回0
+		// Overlapping source blocks were previously stashed, command can proceed
+		if (params->canwrite) {
+			// We didn't create the stash, so delete after write only if we will
+			// actually perform the write
+			// 因为暂存的stash已经成功加载到buffer, 因此对于后面会真正执行写入操作的命令,就可以在那时写入之后删除此stash.这里先把这个stash标记为可以删除的
+			// 对于block_image_update语句,如果src和tgt block有重叠并且stash加载成功,这里就可以将这个stash标记为可以删除的
+			params->freestash = srchash;
+		}
+		// 这种情况仍然可以认为src加载成功,source blocks与期待的匹配,命令可以执行
+		rc = 0;
+		goto v3out;
+	}
+
+    // 这种情况下, 如果source blocks和target blocks没有重叠,或者上面的LoadStash读取失败
+    // 说明确实遇到了与期望不匹配的数据,更新不能继续,这时将params->isunresumable标记为1,函数返回-1表示失败
+	// Valid source data not available, update cannot be resumed
+	fprintf(stderr, "partition has unexpected contents\n");
+	params->isunresumable = 1;
+
+v3out:
+	if (tgtbuffer) {
+		free(tgtbuffer);
+	}
+
+	return rc;
+}
+
 //block_image_update("/dev/block/bootdevice/by-name/system", package_extract_file("system.transfer.list"), "system.new.dat", "system.patch.dat");
 // args:
 //    - block device (or file) to modify in-place
 //    - transfer list (blob)
 //    - new data stream (filename within package.zip)
 //    - patch stream (filename within package.zip, must be uncompressed)
-
 Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]) {
     Value* blockdev_filename;
     Value* transfer_list_value;
@@ -558,21 +732,18 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
     Value* patch_data_fn;
     bool success = false;
 
-	//ReadValueArgs取得脚本中的/dev/block/bootdevice/by-name/system，package_extract_file("system.transfer.list"),system.new.dat", "system.patch.dat"这四个参数，赋值给blockdev_filename ，transfer_list_value， new_data_fn，patch_data_fn
-	// 因为block_image_update中有类似package_extract_file("system.transfer.list")这种还需要执行才能得到返回值的函数
-	// 在ReadValueArgs中利用va_list等C语言的可变参数宏，将block_image_update的四个输入参数"/dev/block/bootdevice/by-name/system", package_extract_file("system.transfer.list"), "system.new.dat", "system.patch.dat"，分别赋值给blockdev_filename，transfer_list_value，new_data_fn，patch_data_fn
+
     if (ReadValueArgs(state, argv, 4, &blockdev_filename, &transfer_list_value,
                       &new_data_fn, &patch_data_fn) < 0) {
         return NULL;
     }
 
     if (blockdev_filename->type != VAL_STRING) {
-	//在BlockImageUpdateFn函数中name就是block_image_update,这个错误log的意思就是block_image_update的blockdev_filename参数必须是string类型
+	
         ErrorAbort(state, "blockdev_filename argument to %s must be string", name);
         goto done;
     }
-	//在package_extract_file("system.transfer.list"),中将type设为了VAL_BLOB
-	//BLOB (binary large object)，二进制大对象，是一个可以存储二进制文件的容器 //BLOB是一个大文件，典型的BLOB是一张图片或一个声音文件，由于它们的尺寸，必须使用特殊的方式来处理（例如：上传、下载或者存放到一个数据库）
+	
     if (transfer_list_value->type != VAL_BLOB) {
         ErrorAbort(state, "transfer_list argument to %s must be blob", name);
         goto done;
@@ -586,31 +757,26 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
         goto done;
     }
 
-	// 这里的ui是updater info的含义，而不是user interface
+	
     UpdaterInfo* ui = (UpdaterInfo*)(state->cookie);
-    // 升级时updater子进程通过cmd_pipe将progress进度传给recovery进程
+    
     FILE* cmd_pipe = ui->cmd_pipe;
 
-	// za这时就代表zip格式的整个ota包
+	
     ZipArchive* za = ((UpdaterInfo*)(state->cookie))->package_zip;
 
-	//patch_data_fn->data指向的是“system.patch.dat”这段字符串，而不是 system.patch.dat这个文件的内容，
-    //因此patch_entry就代表内存中的zip安装包中的system.patch.dat这一项
+
     const ZipEntry* patch_entry = mzFindZipEntry(za, patch_data_fn->data);
     if (patch_entry == NULL) {
         ErrorAbort(state, "%s(): no file \"%s\" in package", name, patch_data_fn->data);
         goto done;
     }
 
-	// 计算出patch_entry的起始地址patch_start，因为注释中说patch stream must be uncompressed
-	// patch_start在下面循环中执行bsdiff或imgdiff命令中会用到
-	// package_zip_addr + mzGetZipEntryOffset(patch_entry) zip安装包在内存中的绝对地址+ system.patch.dat在zip包内的相对偏移地址
-	// 因此patch_start就代表压缩包中system.patch.dat文件在内存中的绝对地址
+
     uint8_t* patch_start = ((UpdaterInfo*)(state->cookie))->package_zip_addr +
         mzGetZipEntryOffset(patch_entry);
 
-	//new_data_fn->data指向的数据是“system.new.dat”，而不是system.new.dat这个文件的内容
-	//new_entry就代表内存中的zip安装包中的system.new.dat这一项
+
     const ZipEntry* new_entry = mzFindZipEntry(za, new_data_fn->data);
     if (new_entry == NULL) {
         ErrorAbort(state, "%s(): no file \"%s\" in package", name, new_data_fn->data);
@@ -645,7 +811,7 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
 	//    stash <stash_id> <src_range>
 	// 	    - (version 2 only) load the given source range and stash
 	// 	      the data in the given slot of the stash table.
-	//      V2新增,the given slot of the stash table就是stash_id
+	//      
 	//
     // The creator of the transfer list will guarantee that no block
     // is read (ie, used as the source for a patch or move) after it
@@ -654,16 +820,10 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
 	// In version 2, the creator will guarantee that a given stash is
     // loaded (with a stash command) before it's used in a
 	// move/bsdiff/imgdiff command.
-	// 创建transfer list时会保证 一个stash在stash命令中的加载 会放在被move/bsdiff/imgdiff命令使用此stash之前
+	
 	// 
 	
-// v2中,支持一个新命令stash, stash将从source img中读取的数据,保存到
-// 分配的内存"stash table", 随后会 用stash table中刚存储的项去填充
-// source data中丢失的字节位,因为这些字节位在执行move/bsdiff/imgdiff
-// 时是不允许去读的
-// 这会产生更小的升级包,因为我们可以通过把数据存储到别处然后以后使用的方式, 
-// 来到达 按pieces是怎么更新的顺序 来组织
-// 而不是一点都不使用 作为输入的数据来对系统打patch
+
 	//
     // Within one command the source and target ranges may overlap so
     // in general we need to read the entire source into memory before
@@ -675,45 +835,26 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
     // already compressed, we lose very little by not compressing
     // their concatenation.)
 
-// we expand the new data from the archive in a
-// background thread, and block that threads 'receive uncompressed
-// data' function until the main thread has reached a point where we
-// want some new data to be written.  We signal the background thread
-// with the destination for the data and block the main thread,
-// waiting for the background thread to complete writing that section.
-// Then it signals the main thread to wake up and goes back to
-// blocking waiting for a transfer.
-// NewThreadInfo is the struct used to pass information back and forth
-// between the two threads.  When the main thread wants some data
-// written, it sets rss to the destination location and signals the
-// condition.  When the background thread is done writing, it clears
-// rss and signals the condition again.
+
     pthread_t new_data_thread;
     NewThreadInfo nti;
-    // nti.za就代表整个zip格式的ota包
+    
     nti.za = za;
-	// 这里就将ota zip包中的system.new.dat传给了nti.entry
+	
     nti.entry = new_entry;
 	//先将rss标记置空
     nti.rss = NULL;
-	//互斥锁的初始化
+	
     pthread_mutex_init(&nti.mu, NULL);
-	//创建一个条件变量，cv就是condition value的意思
-	 //extern int pthread_cond_init __P ((pthread_cond_t *__cond,__const pthread_condattr_t *__cond_attr)); 其中cond是一个指向结构pthread_cond_t的指针，cond_attr是一个指向结构pthread_condattr_t的指 针。结构 pthread_condattr_t是条件变量的属性结构，和互斥锁一样我 们可以用它来设置条件变量是进程内可用还是进程间可用，默认值是 PTHREAD_ PROCESS_PRIVATE，即此条件变量被同一进程内的各个线程使用
+
     pthread_cond_init(&nti.cv, NULL);
 
-	//线程具有属性,用pthread_attr_t表示,在对该结构进行处理之前必须进行初始化，我们用pthread_attr_init函数对其初始化，用pthread_attr_destroy对其去除初始化
+	
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-	//pthread_attr_setdetachstate 修改线程的分离状态属性，可以使用pthread_attr_setdetachstate函数把线程属性detachstate设置为下面的两个合法值之一：设置为PTHREAD_CREATE_DETACHED,以分离状态启动线程；或者设置为PTHREAD_CREATE_JOINABLE,正常启动线程。线程的分离状态决定一个线程以什么样的方式来终止自己。在默认情况下线程是非分离状态的，这种情况下，原有的线程等待创建的线程结束。只有当pthread_join（）函数返回时，创建的线程才算终止，才能释放自己占用的系统资源。
+	
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
-	//pthread_create的四个参数：1指向线程标识符的指针 2 设置线程属性 3 线程运行函数的起始地址 4 运行函数的参数。
-	// pthread_create将会创建线程,在线程创建以后，就开始运行相关的线程函数
-	// 因此在BlockImageUpdateFn中将会创建出一个线程,
-    //线程标识符--new_data_thread,   //线程属性attr设置为了PTHREAD_CREATE_JOINABLE,代表非分离线程,非分离的线程终止时，其线程ID和退出状态将保留，直到另外一个线程调用pthread_join.
-    // 线程函数的起始地址, 这里就是执行unzip_new_data函数
-    //nti--传给unzip_new_data函数的参数
-    // 创建名为调用unzip_new_data的现场,在其中执行unzip_new_data,在unzip_new_data中调用mzProcessZipEntryContents完成对system.new.data文件的解压
+	
     pthread_create(&new_data_thread, &attr, unzip_new_data, &nti);
 
     int i, j;
@@ -721,44 +862,43 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
     char* linesave;
     char* wordsave;
 
-    // 代开文件/dev/block/bootdevice/by-name/system
+    
     int fd = open(blockdev_filename->data, O_RDWR);
     if (fd < 0) {
         ErrorAbort(state, "failed to open %s: %s", blockdev_filename->data, strerror(errno));
         goto done;
     }
 
-    // line用于保存transfer.list文件的每一单行
+    
     char* line;
     char* word;
 
     // The data in transfer_list_value is not necessarily
     // null-terminated, so we need to copy it to a new buffer and add
     // the null that strtok_r will need.
-    // 分配一段内存,在之后用于保存transfer.list文件所有内容,transfer_list指向分配的这段内存
+    
     transfer_list = malloc(transfer_list_value->size+1);
     if (transfer_list == NULL) {
         fprintf(stderr, "failed to allocate %zd bytes for transfer list\n",
                 transfer_list_value->size+1);
         exit(1);
     }
-	//将system.transfer.list文件的所有内容读取到了transfer_list指向的内存中
+	
     memcpy(transfer_list, transfer_list_value->data, transfer_list_value->size);
-	//按行分割读取system.transfer.list中的命令
+	
     transfer_list[transfer_list_value->size] = '\0';
 
-    // 读取transfer.list文件的第1行
+    
     line = strtok_r(transfer_list, "\n", &linesave);
 
-    // version保存transfer.list文件第一行版本号
+    
     int version;
-    // first line in transfer list is the version number; currently
-    // there's only version 1.
-	// recovery 5.0 lollipop-erlease对应的api是1
-	// 90221205a3e58f2a198faa838088dc7bc7c9c752 Support resuming block based OTAs Change-Id: I1e752464134aeb2d396946348e6041acabe13942 开始新增V3
+
+	
+	
 	if (strcmp(line, "1") == 0) {
 		version = 1;
-	// d83e4f15890ac6ebe0d61924bd224eb1ae8565ad support for version 2 of block image diffs Change-Id: I4559bfd76d5403859637aeac832f3a5e9e13b63a 开始新增V2
+	
 	} else if (strcmp(line, "2") == 0) {
 		version = 2;
 	} else {
@@ -769,7 +909,7 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
 
     // second line in transfer list is the total number of blocks we
     // expect to write.
-    // 读取transfer.list文件的第2行
+    
     line = strtok_r(NULL, "\n", &linesave);
     int total_blocks = strtol(line, NULL, 0);
     // shouldn't happen, but avoid divide by zero.
@@ -780,7 +920,7 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
 	uint8_t** stash_table = NULL;
 	if (version >= 2) {
 		// Next line is how many stash entries are needed simultaneously.
-		// transfer.list从V2开始,第3行为同时并存的stash文件数
+		
 		line = strtok_r(NULL, "\n", &linesave);
 		int stash_entries = strtol(line, NULL, 0);
 
@@ -794,8 +934,8 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
 		// Next line is the maximum number of blocks that will be
 		// stashed simultaneously.  This could be used to verify that
 		// enough memory or scratch disk space is available.
-		// transfer.list从V2开始,第4行为最大stash文件所占用的block空间数
-		// stash_max_blocks可用于检测是否有足够多可用的内存或零散磁盘空间
+		 
+		
 		line = strtok_r(NULL, "\n", &linesave);
 		int stash_max_blocks = strtol(line, NULL, 0);
 	 }
@@ -805,7 +945,7 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
     size_t buffer_alloc = 0;
 
     // third and subsequent lines are all individual transfer commands.
-	// 在这个for循环中依次读取每行命令
+	// 
     for (line = strtok_r(NULL, "\n", &linesave); line;
          line = strtok_r(NULL, "\n", &linesave)) {
 
@@ -949,12 +1089,7 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
 
         } else if (strcmp("bsdiff", style) == 0 ||
                    strcmp("imgdiff", style) == 0) {
-            // V1:bsdiff patchstart patchlen [src rangeset] [tgt rangeset] imgdiff patchstart patchlen [src rangeset] [tgt rangeset] read the source blocks, apply a patch, write result to target blocks.
-            // read the source blocks, apply a patch, write result to target blocks.  bsdiff or imgdiff specifies the type of patch. 
-            // bsdiff 0(patch_offset) 35581(patch_len) 67a63498a1293c14e23768bf7200348b8837e949 9c06e7e0277dee8c98e9a8b2a10d8649f6cfb3b0 2,367217,368194 979 2,367217,368196
-            // imgdiff 134034 2022 192e81959ac1985b1d90962faae1286029d4f39e 021c103903aa2da3ef222e1da5bdccdee287d1c3 2,40903,41035 132 2,40904,41036
-            // bsdiff 0(patch_offset) 35581(patch_len) 2,367217,368194(src_range) 2,367217,368196(tgt_range)
-            // imgdiff 134034(patch_offset) 2022(patch_len) 2,40903,41035(src_range) 132 2,40904,41036(tgt_range)     
+ 
             word = strtok_r(NULL, " ", &wordsave);
             size_t patch_offset = strtoul(word, NULL, 0);
             word = strtok_r(NULL, " ", &wordsave);
@@ -975,8 +1110,7 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
             Value patch_value;
             patch_value.type = VAL_BLOB;
             patch_value.size = patch_len;
-            // patch_start是ota压缩包中system.patch.dat文件在内存中的绝对地址, patch_offset是imgdiff或bsdiff命令要打的补丁数据在system.patch.dat中的相对地址
-            // 因此patch_value.data指向的就是此补丁数据在system.patch.dat中的绝对地址
+            
             patch_value.data = (char*)(patch_start + patch_offset);
 
             RangeSinkState rss;
@@ -997,9 +1131,9 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
             }
 
             // We expect the output of the patcher to fill the tgt ranges exactly.
-            // 打完pathc后rss.p_block就是新生成的目标大小
+            
             if (rss.p_block != tgt->count || rss.p_remain != 0) {
-                //对于ApplyImagePatch或ApplyBSDiffPatch,都是在RangeSinkWrite中完成rss->p_remain-=write_now 正常情况下rss.p_remain应为0
+                
                 fprintf(stderr, "range sink underrun?\n");
             }
 
@@ -1009,14 +1143,14 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
 
             free(tgt);
         } else if (!DEBUG_ERASE && strcmp("erase", style) == 0) {
-            // DEBUG_ERASE:Set this to 0 to interpret 'erase' transfers to mean do a BLKDISCARD ioctl (the normal behavior).
-            //DEBUG_ERASE 默认为0, 这时执行system.transfer.list中的erase命令时
-            //erase 14,546363,556544,557570,589312,590338,622080,623106,654848,655874,687616,688642,720384,721410,753152
+            
+            
+            
             struct stat st;
-            //先根据open(blockdev_filename->data)读到的fd 判断target是不是块设备
+            
             if (fstat(fd, &st) == 0 && S_ISBLK(st.st_mode)) {
                 word = strtok_r(NULL, " ", &wordsave);
-                // word 14,546363,....,753152
+                
                 RangeSet* tgt = parse_range(word);
 
                 printf("  erasing %d blocks\n", tgt->size);
@@ -1024,14 +1158,13 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
                 for (i = 0; i < tgt->count; ++i) {
                     uint64_t range[2];
                     // offset in bytes
-                    // range[0] 每个区间的起始位置
+                    
                     range[0] = tgt->pos[i*2] * (uint64_t)BLOCKSIZE;
                     // len in bytes
-                    // range[1] 每个区间的长度
+                    
                     range[1] = (tgt->pos[i*2+1] - tgt->pos[i*2]) * (uint64_t)BLOCKSIZE;
 
-                    // #define BLKDISCARD _IO(0x12,119)blkdiscard is used to discard device sectors.This is useful for solid-state drivers (SSDs) and thinly-provisioned storage 
-                    //调用ioctl屏蔽range描述的块组区间
+                    
                     if (ioctl(fd, BLKDISCARD, &range) < 0) {
                         printf("    blkdiscard failed: %s\n", strerror(errno));
                     }
@@ -1047,14 +1180,14 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
         }
     }
 
-    // 调用pthread_join等待子线程new_data_thread的结束
+    
     pthread_join(new_data_thread, NULL);
     success = true;
 
     free(buffer);
-    // blocks_so_far为实际写入的block个数,total_blocks为升级脚本第二行计划写入的block个数.正常情况下两者相等.
+    
     printf("wrote %d blocks; expected %d\n", blocks_so_far, total_blocks);
-    // 这是buffer_alloc的大小就是执行transfer.list中命令过程中最大分配的一段内存大小
+    
     printf("max alloc needed was %zu\n", buffer_alloc);
 
   done:
@@ -1064,6 +1197,902 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
     FreeValue(new_data_fn);
     FreeValue(patch_data_fn);
     return StringValue(success ? strdup("t") : strdup(""));
+}
+
+static int PerformCommandMove(CommandParameters* params) {
+    int blocks = 0;
+    int overlap = 0;
+    int rc = -1;
+    int status = 0;
+    RangeSet* tgt = NULL;
+
+    if (!params) {
+        goto pcmout;
+    }
+
+    if (params->version == 1) {
+        status = LoadSrcTgtVersion1(&params->cpos, &tgt, &blocks, &params->buffer,
+                    &params->bufsize, params->fd);
+    } else if (params->version == 2) {
+        status = LoadSrcTgtVersion2(&params->cpos, &tgt, &blocks, &params->buffer,
+                    &params->bufsize, params->fd, params->stashbase, NULL);
+    } else if (params->version >= 3) {
+        status = LoadSrcTgtVersion3(params, &tgt, &blocks, 1, &overlap);
+    }
+
+    if (status == -1) {
+        fprintf(stderr, "failed to read blocks for move\n");
+        goto pcmout;
+    }
+
+    if (status == 0) {
+        params->foundwrites = 1;
+    } else if (params->foundwrites) {
+        fprintf(stderr, "warning: commands executed out of order [%s]\n", params->cmdname);
+    }
+
+    if (params->canwrite) {
+        if (status == 0) {
+            fprintf(stderr, "  moving %d blocks\n", blocks);
+
+            if (WriteBlocks(tgt, params->buffer, params->fd) == -1) {
+                goto pcmout;
+            }
+        } else {
+            fprintf(stderr, "skipping %d already moved blocks\n", blocks);
+        }
+
+    }
+
+    if (params->freestash) {
+        FreeStash(params->stashbase, params->freestash);
+        params->freestash = NULL;
+    }
+
+    params->written += tgt->size;
+    rc = 0;
+
+pcmout:
+    if (tgt) {
+        free(tgt);
+    }
+
+    return rc;
+}
+
+static int PerformCommandStash(CommandParameters* params) {
+    if (!params) {
+        return -1;
+    }
+
+    return SaveStash(params->stashbase, &params->cpos, &params->buffer, &params->bufsize,
+                params->fd, (params->version >= 3), &params->isunresumable);
+}
+
+static int PerformCommandFree(CommandParameters* params) {
+    if (!params) {
+        return -1;
+    }
+
+    if (params->createdstash || params->canwrite) {
+        return FreeStash(params->stashbase, params->cpos);
+    }
+
+    return 0;
+}
+
+static int PerformCommandZero(CommandParameters* params) {
+    char* range = NULL;
+    int i;
+    int j;
+    int rc = -1;
+    RangeSet* tgt = NULL;
+
+    if (!params) {
+        goto pczout;
+    }
+
+    range = strtok_r(NULL, " ", &params->cpos);
+
+    if (range == NULL) {
+        fprintf(stderr, "missing target blocks for zero\n");
+        goto pczout;
+    }
+
+    tgt = parse_range(range);
+
+    fprintf(stderr, "  zeroing %d blocks\n", tgt->size);
+
+    allocate(BLOCKSIZE, &params->buffer, &params->bufsize);
+    memset(params->buffer, 0, BLOCKSIZE);
+
+    if (params->canwrite) {
+        for (i = 0; i < tgt->count; ++i) {
+            if (check_lseek(params->fd, (off64_t) tgt->pos[i * 2] * BLOCKSIZE, SEEK_SET) == -1) {
+                goto pczout;
+            }
+
+            for (j = tgt->pos[i * 2]; j < tgt->pos[i * 2 + 1]; ++j) {
+                if (write_all(params->fd, params->buffer, BLOCKSIZE) == -1) {
+                    goto pczout;
+                }
+            }
+        }
+    }
+
+    if (params->cmdname[0] == 'z') {
+        // Update only for the zero command, as the erase command will call
+        // this if DEBUG_ERASE is defined.
+        params->written += tgt->size;
+    }
+
+    rc = 0;
+
+pczout:
+    if (tgt) {
+        free(tgt);
+    }
+
+    return rc;
+}
+
+static int PerformCommandNew(CommandParameters* params) {
+    char* range = NULL;
+    int rc = -1;
+    RangeSet* tgt = NULL;
+    RangeSinkState rss;
+
+    if (!params) {
+        goto pcnout;
+    }
+
+    range = strtok_r(NULL, " ", &params->cpos);
+
+    if (range == NULL) {
+        goto pcnout;
+    }
+
+    tgt = parse_range(range);
+
+    if (params->canwrite) {
+        fprintf(stderr, " writing %d blocks of new data\n", tgt->size);
+
+        rss.fd = params->fd;
+        rss.tgt = tgt;
+        rss.p_block = 0;
+        rss.p_remain = (tgt->pos[1] - tgt->pos[0]) * BLOCKSIZE;
+
+        if (check_lseek(params->fd, (off64_t) tgt->pos[0] * BLOCKSIZE, SEEK_SET) == -1) {
+            goto pcnout;
+        }
+
+        pthread_mutex_lock(&params->nti.mu);
+        params->nti.rss = &rss;
+        pthread_cond_broadcast(&params->nti.cv);
+
+        while (params->nti.rss) {
+            pthread_cond_wait(&params->nti.cv, &params->nti.mu);
+        }
+
+        pthread_mutex_unlock(&params->nti.mu);
+    }
+
+    params->written += tgt->size;
+    rc = 0;
+
+pcnout:
+    if (tgt) {
+        free(tgt);
+    }
+
+    return rc;
+}
+
+// V1:bsdiff/imgdiff patchstart patchlen [src rangeset] [tgt rangeset]
+// read the source blocks, apply a patch, write result to target blocks.  bsdiff or imgdiff specifies the type of patch. 
+// bsdiff 0(patch_offset) 35581(patch_len) 2,367217,368194(src_range) 2,367217,368196(tgt_range)
+// imgdiff 134034(patch_offset) 2022(patch_len) 2,40903,41035(src_range) 132 2,40904,41036(tgt_range)	
+// V2:bsdiff/imgdiff <patchstart> <patchlen> <tgt_range> <src_block_count> <src_range> (loads data from source image only)
+//    bsdiff/imgdiff <patchstart> <patchlen> <tgt_range> <src_block_count> - <[stash_id:stash_range] ...> (loads data from stashes only)
+//    bsdiff/imgdiff <patchstart> <patchlen> <tgt_range> <src_block_count> <src_range> <src_loc> <[stash_id:stash_range] ...>  (loads data from both source image and stashes)
+
+// V3:bsdiff/imgdiff <patchstart> <patchlen> <onehash> <tgt_range> <src_block_count> <src_range> (loads data from source image only)
+//    bsdiff/imgdiff <patchstart> <patchlen> <onehash> <tgt_range> <src_block_count> - <[stash_id:stash_range] ...> (loads data from stashes only)
+//    bsdiff/imgdiff <patchstart> <patchlen> <onehash> <tgt_range> <src_block_count> <src_range> <src_loc> <[stash_id:stash_range] ...>  (loads data from both source image and stashes)
+// read the source blocks, apply a patch (or not in the case of move), write result to target blocks.
+// bsdiff 0(patch_offset) 35581(patch_len) 67a63498a1293c14e23768bf7200348b8837e949 9c06e7e0277dee8c98e9a8b2a10d8649f6cfb3b0 2,367217,368194 979 2,367217,368196
+// imgdiff 134034 2022 192e81959ac1985b1d90962faae1286029d4f39e 021c103903aa2da3ef222e1da5bdccdee287d1c3 2,40903,41035 132 2,40904,41036
+static int PerformCommandDiff(CommandParameters* params) {
+    char* logparams = NULL;
+    char* value = NULL;
+    int blocks = 0;
+    int overlap = 0;
+    int rc = -1;
+    int status = 0;
+    RangeSet* tgt = NULL;
+    RangeSinkState rss;
+    size_t len = 0;
+    size_t offset = 0;
+    Value patch_value;
+
+    if (!params) {
+        goto pcdout;
+    }
+
+    // params->cpos执行的就是transfer.list中命令名后面的所有字符串
+    logparams = strdup(params->cpos);
+    value = strtok_r(NULL, " ", &params->cpos);
+
+    if (value == NULL) {
+        fprintf(stderr, "missing patch offset for %s\n", params->cmdname);
+        goto pcdout;
+    }
+
+    //解析得到bsdiff/imgdiff命令的  patch offset参数
+    offset = strtoul(value, NULL, 0);
+
+    value = strtok_r(NULL, " ", &params->cpos);
+
+    if (value == NULL) {
+        fprintf(stderr, "missing patch length for %s\n", params->cmdname);
+        goto pcdout;
+    }
+
+    //解析得到bsdiff/imgdiff命令的  patch length参数
+    len = strtoul(value, NULL, 0);
+
+    if (params->version == 1) {
+        status = LoadSrcTgtVersion1(&params->cpos, &tgt, &blocks, &params->buffer,
+                    &params->bufsize, params->fd);
+    } else if (params->version == 2) {
+        status = LoadSrcTgtVersion2(&params->cpos, &tgt, &blocks, &params->buffer,
+                    &params->bufsize, params->fd, params->stashbase, NULL);
+    } else if (params->version >= 3) {
+        status = LoadSrcTgtVersion3(params, &tgt, &blocks, 0, &overlap);
+    }
+
+    if (status == -1) {
+        fprintf(stderr, "failed to read blocks for diff\n");
+        goto pcdout;
+    }
+
+    if (status == 0) {
+        params->foundwrites = 1;
+    } else if (params->foundwrites) {
+        fprintf(stderr, "warning: commands executed out of order [%s]\n", params->cmdname);
+    }
+
+    if (params->canwrite) {
+        if (status == 0) {
+            fprintf(stderr, "patching %d blocks to %d\n", blocks, tgt->size);
+
+            patch_value.type = VAL_BLOB;
+            patch_value.size = len;
+            // patch_start是ota压缩包中system.patch.dat文件在内存中的绝对地址, patch_offset是imgdiff或bsdiff命令要打的补丁数据在system.patch.dat中的相对地址
+            // 因此patch_value.data指向的就是此补丁数据在system.patch.dat中的绝对地址
+            patch_value.data = (char*) (params->patch_start + offset);
+
+            rss.fd = params->fd;
+            rss.tgt = tgt;
+            rss.p_block = 0;
+            rss.p_remain = (tgt->pos[1] - tgt->pos[0]) * BLOCKSIZE;
+
+            if (check_lseek(params->fd, (off64_t) tgt->pos[0] * BLOCKSIZE, SEEK_SET) == -1) {
+                goto pcdout;
+            }
+
+            if (params->cmdname[0] == 'i') {      // imgdiff
+                ApplyImagePatch(params->buffer, blocks * BLOCKSIZE, &patch_value,
+                    &RangeSinkWrite, &rss, NULL, NULL);
+            } else {
+                ApplyBSDiffPatch(params->buffer, blocks * BLOCKSIZE, &patch_value,
+                    0, &RangeSinkWrite, &rss, NULL);
+            }
+
+            // We expect the output of the patcher to fill the tgt ranges exactly.
+            // 打完pathc后rss.p_block就是新生成的目标大小
+            if (rss.p_block != tgt->count || rss.p_remain != 0) {
+                //对于ApplyImagePatch或ApplyBSDiffPatch,都是在RangeSinkWrite中完成rss->p_remain-=write_now 正常情况下rss.p_remain应为0
+                fprintf(stderr, "range sink underrun?\n");
+            }
+        } else {
+            // status为1才能执行到这里,这种情况说明tgt与tgt hash匹配,命令不用执行
+            fprintf(stderr, "skipping %d blocks already patched to %d [%s]\n",
+                blocks, tgt->size, logparams);
+        }
+    }
+
+    if (params->freestash) {
+        FreeStash(params->stashbase, params->freestash);
+        params->freestash = NULL;
+    }
+
+    params->written += tgt->size;
+    rc = 0;
+
+pcdout:
+    if (logparams) {
+        free(logparams);
+    }
+
+    if (tgt) {
+        free(tgt);
+    }
+
+    return rc;
+}
+
+//v1 v2:erase 14,546363,556544,557570,589312,590338,622080,623106,654848,655874,687616,688642,720384,721410,753152
+//v3:erase 18,465883,491008,492034,523776,524802,556544,557570,589312,590338,622080,623106,654848,655874,687616,688642,720384,721410,753152
+static int PerformCommandErase(CommandParameters* params) {
+    char* range = NULL;
+    int i;
+    int rc = -1;
+    RangeSet* tgt = NULL;
+    struct stat st;
+    uint64_t blocks[2];
+
+    // DEBUG_ERASE:Set this to 0 to interpret 'erase' transfers to mean do a BLKDISCARD ioctl (the normal behavior).
+    //DEBUG_ERASE 默认为0, 这时执行system.transfer.list中的erase命令时
+    if (DEBUG_ERASE) {
+        return PerformCommandZero(params);
+    }
+
+    if (!params) {
+        goto pceout;
+    }
+
+    //先根据open(blockdev_filename->data)读到的fd 判断target是不是块设备
+    if (fstat(params->fd, &st) == -1) {
+        fprintf(stderr, "failed to fstat device to erase (errno %d)\n", errno);
+        goto pceout;
+    }
+
+    //先根据open(blockdev_filename->data)读到的fd 判断target是不是块设备
+    if (!S_ISBLK(st.st_mode)) {
+        fprintf(stderr, "not a block device; skipping erase\n");
+        rc = 0;
+        goto pceout;
+    }
+
+    range = strtok_r(NULL, " ", &params->cpos);
+
+    if (range == NULL) {
+        fprintf(stderr, "missing target blocks for zero\n");
+        goto pceout;
+    }
+
+    // range 14,546363,....,753152
+    tgt = parse_range(range);
+
+    if (params->canwrite) {
+        fprintf(stderr, " erasing %d blocks\n", tgt->size);
+
+        for (i = 0; i < tgt->count; ++i) {
+            // offset in bytes
+            // blocks[0] 每个区间的起始位置
+            blocks[0] = tgt->pos[i * 2] * (uint64_t) BLOCKSIZE;
+            // length in bytes
+            // blocks[1] 每个区间的长度
+            blocks[1] = (tgt->pos[i * 2 + 1] - tgt->pos[i * 2]) * (uint64_t) BLOCKSIZE;
+
+			// #define BLKDISCARD _IO(0x12,119)blkdiscard is used to discard device sectors.This is useful for solid-state drivers (SSDs) and thinly-provisioned storage 
+			//调用ioctl屏蔽range描述的块组区间
+            if (ioctl(params->fd, BLKDISCARD, &blocks) == -1) {
+                fprintf(stderr, "failed to blkdiscard (errno %d)\n", errno);
+                // Continue anyway, nothing we can do
+            }
+        }
+    }
+
+    rc = 0;
+
+pceout:
+    if (tgt) {
+        free(tgt);
+    }
+
+    return rc;
+}
+
+// Definitions for transfer list command functions
+typedef int (*CommandFunction)(CommandParameters*);
+
+typedef struct {
+    const char* name;
+    CommandFunction f;	
+} Command;
+
+// CompareCommands and CompareCommandNames are for the hash table
+static int CompareCommands(const void* c1, const void* c2) {
+    return strcmp(((const Command*) c1)->name, ((const Command*) c2)->name);
+}
+static int CompareCommandNames(const void* c1, const void* c2) {
+    return strcmp(((const Command*) c1)->name, (const char*) c2);
+} 
+
+// HashString is used to hash command names for the hash table
+// 输出为一个字符串,输出为一个int型的hash值
+//在用到hash进行管理的数据结构中，比如hashmap，hash值（key）存在的目的是加速键值对的查找，key的作用是为了将元素适当地放在各个桶里，对于抗碰撞的要求没有那么高。换句话说，hash出来的key，只要保证value大致均匀的放在不同的桶里就可以了
+static unsigned int HashString(const char *s) {
+    unsigned int hash = 0;
+    if (s) {
+        while (*s) {
+            hash = hash * 33 + *s++;
+        }
+    }
+    return hash;
+}
+
+// args:
+//    - block device (or file) to modify in-place
+//    - transfer list (blob)
+//    - new data stream (filename within package.zip)
+//    - patch stream (filename within package.zip, must be uncompressed)
+//in-place操作，意思是所有的操作都是”就地“操作，不允许进行移动，或者称作 原位操作，即不允许使用临时变量。
+//block_image_update("/dev/block/platform/soc.0/f9824900.sdhci/by-name/system", package_extract_file("system.transfer.list"), "system.new.dat", "system.patch.dat");
+// argc就是block_image_update或block_image_verify的参数个数,argv数组的每个值就是block_image_update或block_image_verify的各个参数
+// command就是block_image_update或block_image_verify支持的命令数组
+// cmdcount就是block_image_update或block_image_verify支持的命令的个数
+static Value* PerformBlockImageUpdate(const char* name, State* state, int argc, Expr* argv[],
+            const Command* commands, int cmdcount, int dryrun) {
+
+    char* line = NULL;
+    char* linesave = NULL;
+    char* logcmd = NULL;
+    char* transfer_list = NULL;
+    CommandParameters params;
+    const Command* cmd = NULL;
+    const ZipEntry* new_entry = NULL;
+    const ZipEntry* patch_entry = NULL;
+    FILE* cmd_pipe = NULL;
+    HashTable* cmdht = NULL;
+    int i;
+    int res;
+    int rc = -1;
+    int stash_max_blocks = 0;
+    int total_blocks = 0;
+    pthread_attr_t attr;
+    unsigned int cmdhash;
+    UpdaterInfo* ui = NULL;
+    Value* blockdev_filename = NULL;
+    Value* new_data_fn = NULL;
+    Value* patch_data_fn = NULL;
+    Value* transfer_list_value = NULL;
+    ZipArchive* za = NULL;
+
+    memset(&params, 0, sizeof(params));
+    params.canwrite = !dryrun;
+
+    fprintf(stderr, "performing %s\n", dryrun ? "verification" : "update");
+
+	//ReadValueArgs取得脚本中的/dev/block/bootdevice/by-name/system，package_extract_file("system.transfer.list"),system.new.dat", "system.patch.dat"这四个参数，赋值给blockdev_filename ，transfer_list_value， new_data_fn，patch_data_fn
+	// 因为block_image_update中有类似package_extract_file("system.transfer.list")这种还需要执行才能得到返回值的函数
+	// 在ReadValueArgs中利用va_list等C语言的可变参数宏，将block_image_update的四个输入参数"/dev/block/bootdevice/by-name/system", package_extract_file("system.transfer.list"), "system.new.dat", "system.patch.dat"，分别赋值给blockdev_filename，transfer_list_value，new_data_fn，patch_data_fn
+    // ReadValueArgs成功执行后:
+    // blockdev_filename -- /dev/block/bootdevice/by-name/system
+    // transfer_list_value -- system.transfer.list文件内容
+    // new_data_fn -- system.new.dat, new_data_fn -- system.patch.dat
+    if (ReadValueArgs(state, argv, 4, &blockdev_filename, &transfer_list_value,
+            &new_data_fn, &patch_data_fn) < 0) {
+        goto pbiudone;
+    }
+
+    if (blockdev_filename->type != VAL_STRING) {
+        //在BlockImageUpdateFn函数中name就是block_image_update,这个错误log的意思就是block_image_update的blockdev_filename参数必须是string类型
+        ErrorAbort(state, "blockdev_filename argument to %s must be string", name);
+        goto pbiudone;
+    }
+    //在package_extract_file("system.transfer.list"),中将type设为了VAL_BLOB
+	//BLOB (binary large object)，二进制大对象，是一个可以存储二进制文件的容器 //BLOB是一个大文件，典型的BLOB是一张图片或一个声音文件，由于它们的尺寸，必须使用特殊的方式来处理（例如：上传、下载或者存放到一个数据库）
+    if (transfer_list_value->type != VAL_BLOB) {
+        ErrorAbort(state, "transfer_list argument to %s must be blob", name);
+        goto pbiudone;
+    }
+    if (new_data_fn->type != VAL_STRING) {
+        ErrorAbort(state, "new_data_fn argument to %s must be string", name);
+        goto pbiudone;
+    }
+    if (patch_data_fn->type != VAL_STRING) {
+        ErrorAbort(state, "patch_data_fn argument to %s must be string", name);
+        goto pbiudone;
+    }
+
+    // 这里的ui是updater info的含义，而不是user interface
+    // state.cookie = &updater_info;updater_info.cmd_pipe = cmd_pipe; updater_info.package_zip = &za;updater_info.version = atoi(version);updater_info.package_zip_addr = map.addr;
+    // updater_info.package_zip_len = map.length;
+    ui = (UpdaterInfo*) state->cookie;
+
+    if (ui == NULL) {
+        goto pbiudone;
+    }
+
+    // 升级时updater子进程通过cmd_pipe将progress进度传给recovery进程
+    cmd_pipe = ui->cmd_pipe;
+    // za就代表整个zip格式的ota包
+    za = ui->package_zip;
+
+    if (cmd_pipe == NULL || za == NULL) {
+        goto pbiudone;
+    }
+
+	//patch_data_fn->data指向的是“system.patch.dat”这段字符串，而不是 system.patch.dat这个文件的内容，
+    //因此patch_entry就代表内存中的zip安装包中的system.patch.dat这一项
+    // 从ota zip包中找到system.patch.dat文件
+    patch_entry = mzFindZipEntry(za, patch_data_fn->data);
+
+    if (patch_entry == NULL) {
+        fprintf(stderr, "%s(): no file \"%s\" in package", name, patch_data_fn->data);
+        goto pbiudone;
+    }
+
+    //内存中ota zip包起始地址+system.patch.dat在zip包中的相对偏移,得到system.patch.dat文件在内存中地址
+	// 计算出patch_entry的起始地址patch_start，因为注释中说patch stream must be uncompressed
+	// patch_start在下面循环中执行bsdiff或imgdiff命令中会用到
+	// package_zip_addr + mzGetZipEntryOffset(patch_entry) zip安装包在内存中的绝对地址+ system.patch.dat在zip包内的相对偏移地址
+	// 因此patch_start就代表压缩包中system.patch.dat文件在内存中的绝对地址
+    params.patch_start = ui->package_zip_addr + mzGetZipEntryOffset(patch_entry);
+    // new_data_fn->data指向字符串"system.new.dat",从ota zip包中找到system.new.dat文件
+	//new_data_fn->data指向的数据是“system.new.dat”，而不是system.new.dat这个文件的内容
+	//new_entry就代表内存中的zip安装包中的system.new.dat这一项
+    new_entry = mzFindZipEntry(za, new_data_fn->data);
+
+    if (new_entry == NULL) {
+        fprintf(stderr, "%s(): no file \"%s\" in package", name, new_data_fn->data);
+        goto pbiudone;
+    }
+
+    // 打开/dev/block/bootdevice/by-name/system等
+    params.fd = TEMP_FAILURE_RETRY(open(blockdev_filename->data, O_RDWR));
+
+    if (params.fd == -1) {
+        fprintf(stderr, "failed to open %s: %s", blockdev_filename->data, strerror(errno));
+        goto pbiudone;
+    }
+
+    // 对于 block_image_verify,canwrite为0
+    if (params.canwrite) {
+        //block_image_update才会执行这些
+	// we expand the new data from the archive in a
+	// background thread, and block that threads 'receive uncompressed
+	// data' function until the main thread has reached a point where we
+	// want some new data to be written.  We signal the background thread
+	// with the destination for the data and block the main thread,
+	// waiting for the background thread to complete writing that section.
+	// Then it signals the main thread to wake up and goes back to
+	// blocking waiting for a transfer.
+	// NewThreadInfo is the struct used to pass information back and forth
+	// between the two threads.  When the main thread wants some data
+	// written, it sets rss to the destination location and signals the
+	// condition.  When the background thread is done writing, it clears
+	// rss and signals the condition again.
+	    // nti.za就代表整个zip格式的ota包
+        params.nti.za = za;
+        // 这里就将ota zip包中的system.new.dat传给了nti.entry
+        params.nti.entry = new_entry;
+
+        //互斥锁的初始化
+        pthread_mutex_init(&params.nti.mu, NULL);
+        //创建一个条件变量，cv就是condition value的意思
+	    //extern int pthread_cond_init __P ((pthread_cond_t *__cond,__const pthread_condattr_t *__cond_attr)); 其中cond是一个指向结构pthread_cond_t的指针，cond_attr是一个指向结构pthread_condattr_t的指 针。结构 pthread_condattr_t是条件变量的属性结构，和互斥锁一样我 们可以用它来设置条件变量是进程内可用还是进程间可用，默认值是 PTHREAD_ PROCESS_PRIVATE，即此条件变量被同一进程内的各个线程使用
+        pthread_cond_init(&params.nti.cv, NULL);
+        //线程具有属性,用pthread_attr_t表示,在对该结构进行处理之前必须进行初始化，我们用pthread_attr_init函数对其初始化，用pthread_attr_destroy对其去除初始化
+        pthread_attr_init(&attr);
+        //pthread_attr_setdetachstate 修改线程的分离状态属性，可以使用pthread_attr_setdetachstate函数把线程属性detachstate设置为下面的两个合法值之一：设置为PTHREAD_CREATE_DETACHED,以分离状态启动线程；或者设置为PTHREAD_CREATE_JOINABLE,正常启动线程。线程的分离状态决定一个线程以什么样的方式来终止自己。在默认情况下线程是非分离状态的，这种情况下，原有的线程等待创建的线程结束。只有当pthread_join（）函数返回时，创建的线程才算终止，才能释放自己占用的系统资源。
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+
+		//pthread_create的四个参数：1指向线程标识符的指针 2 设置线程属性 3 线程运行函数的起始地址 4 运行函数的参数。
+		// pthread_create将会创建线程,在线程创建以后，就开始运行相关的线程函数
+		// 因此在BlockImageUpdateFn中将会创建出一个线程,
+		//线程标识符--new_data_thread,   //线程属性attr设置为了PTHREAD_CREATE_JOINABLE,代表非分离线程,非分离的线程终止时，其线程ID和退出状态将保留，直到另外一个线程调用pthread_join.
+		// 线程函数的起始地址, 这里就是执行unzip_new_data函数
+		//nti--传给unzip_new_data函数的参数
+		// 创建名为调用unzip_new_data的现场,在其中执行unzip_new_data,在unzip_new_data中调用mzProcessZipEntryContents完成对system.new.data文件的解压
+        if (pthread_create(&params.thread, &attr, unzip_new_data, &params.nti) != 0) {
+            fprintf(stderr, "failed to create a thread (errno %d)\n", errno);
+            goto pbiudone;
+        }
+    }
+
+    // The data in transfer_list_value is not necessarily null-terminated, so we need
+    // to copy it to a new buffer and add the null that strtok_r will need.
+    //将transfer_list文件内容保存到一个字符串指针transfer_list指向的内存中
+    // 分配一段内存,在之后用于保存transfer.list文件所有内容,transfer_list指向分配的这段内存
+    transfer_list = malloc(transfer_list_value->size + 1);
+
+    if (transfer_list == NULL) {
+        fprintf(stderr, "failed to allocate %zd bytes for transfer list\n",
+            transfer_list_value->size + 1);
+        goto pbiudone;
+    }
+
+    //将transfer_list文件内容保存到一个字符串指针transfer_list指向的内存中
+    //将system.transfer.list文件的所有内容读取到了transfer_list指向的内存中
+    memcpy(transfer_list, transfer_list_value->data, transfer_list_value->size);
+    //按行分割读取system.transfer.list中的命令
+    transfer_list[transfer_list_value->size] = '\0';
+
+    // First line in transfer list is the version number
+    // line用于保存transfer.list文件的每一单行
+    // 读取transfer.list文件的第1行
+    line = strtok_r(transfer_list, "\n", &linesave);
+    // version保存transfer.list文件第一行版本号
+    params.version = strtol(line, NULL, 0);
+
+    // recovery 5.0 lollipop-erlease对应的api是1
+    // d83e4f15890ac6ebe0d61924bd224eb1ae8565ad support for version 2 of block image diffs Change-Id: I4559bfd76d5403859637aeac832f3a5e9e13b63a 开始新增V2
+    // commit 90221205a3e58f2a198faa838088dc7bc7c9c752 Support resuming block based OTAs Change-Id: I1e752464134aeb2d396946348e6041acabe13942 开始新增V3
+    if (params.version < 1 || params.version > 3) {
+        fprintf(stderr, "unexpected transfer list version [%s]\n", line);
+        goto pbiudone;
+    }
+
+    fprintf(stderr, "blockimg version is %d\n", params.version);
+
+    // Second line in transfer list is the total number of blocks we expect to write
+    // 读取transfer.list文件的第2行
+    line = strtok_r(NULL, "\n", &linesave);
+    total_blocks = strtol(line, NULL, 0);
+
+    if (total_blocks < 0) {
+        ErrorAbort(state, "unexpected block count [%s]\n", line);
+        goto pbiudone;
+    } else if (total_blocks == 0) {
+        rc = 0;
+        goto pbiudone;
+    }
+
+    if (params.version >= 2) {
+        // Third line is how many stash entries are needed simultaneously
+        // transfer.list从V2开始,第3行为同时并存的stash文件数
+        line = strtok_r(NULL, "\n", &linesave);
+        fprintf(stderr, "maximum stash entries %s\n", line);
+
+        // Fourth line is the maximum number of blocks that will be stashed simultaneously.This could be used to verify that enough memory or scratch disk space is available.
+        // transfer.list从V2开始,第4行为最大stash文件所占用的block空间数.stash_max_blocks可用于检测是否有足够多可用的内存或零散磁盘空间
+        line = strtok_r(NULL, "\n", &linesave);
+        stash_max_blocks = strtol(line, NULL, 0);
+
+        if (stash_max_blocks < 0) {
+            ErrorAbort(state, "unexpected maximum stash blocks [%s]\n", line);
+            goto pbiudone;
+        }
+
+        if (stash_max_blocks > 0) {
+            res = CreateStash(state, stash_max_blocks, blockdev_filename->data,
+                    &params.stashbase);
+
+            if (res == -1) {
+                goto pbiudone;
+            }
+
+            params.createdstash = res;
+        }
+    }
+
+    // Build a hash table of the available commands
+    cmdht = mzHashTableCreate(cmdcount, NULL);
+
+    for (i = 0; i < cmdcount; ++i) {
+        cmdhash = HashString(commands[i].name);
+        mzHashTableLookup(cmdht, cmdhash, (void*) &commands[i], CompareCommands, true);
+    }
+
+    // Subsequent lines are all individual transfer commands
+    // 第四行后面的各行都是独立的命令,在这个for循环中依次读取并执行每行命令
+    for (line = strtok_r(NULL, "\n", &linesave); line;
+         line = strtok_r(NULL, "\n", &linesave)) {
+
+        logcmd = strdup(line);
+        params.cmdname = strtok_r(line, " ", &params.cpos);
+
+        if (params.cmdname == NULL) {
+            fprintf(stderr, "missing command [%s]\n", line);
+            goto pbiudone;
+        }
+
+        cmdhash = HashString(params.cmdname);
+        cmd = (const Command*) mzHashTableLookup(cmdht, cmdhash, params.cmdname,
+                                    CompareCommandNames, false);
+
+        if (cmd == NULL) {
+            fprintf(stderr, "unexpected command [%s]\n", params.cmdname);
+            goto pbiudone;
+        }
+
+        if (cmd->f != NULL && cmd->f(&params) == -1) {
+            fprintf(stderr, "failed to execute command [%s]\n",
+                logcmd ? logcmd : params.cmdname);
+            goto pbiudone;
+        }
+
+        if (logcmd) {
+            free(logcmd);
+            logcmd = NULL;
+        }
+
+        if (params.canwrite) {
+            fprintf(cmd_pipe, "set_progress %.4f\n", (double) params.written / total_blocks);
+            fflush(cmd_pipe);
+        }
+    }
+
+    if (params.canwrite) {
+        // 调用pthread_join等待子线程new_data_thread的结束
+        pthread_join(params.thread, NULL);
+
+        // blocks_so_far为实际写入的block个数,total_blocks为升级脚本第二行计划写入的block个数.正常情况下两者相等.
+        fprintf(stderr, "wrote %d blocks; expected %d\n", params.written, total_blocks);
+        // 这是buffer_alloc的大小就是执行transfer.list中命令过程中最大分配的一段内存大小
+        fprintf(stderr, "max alloc needed was %zu\n", params.bufsize);
+
+        // Delete stash only after successfully completing the update, as it
+        // may contain blocks needed to complete the update later.
+        DeleteStash(params.stashbase);
+    } else {
+        fprintf(stderr, "verified partition contents; update may be resumed\n");
+    }
+
+    rc = 0;
+
+pbiudone:
+    if (params.fd != -1) {
+        if (fsync(params.fd) == -1) {
+            fprintf(stderr, "failed to fsync device (errno %d)\n", errno);
+        }
+        TEMP_FAILURE_RETRY(close(params.fd));
+    }
+
+    if (logcmd) {
+        free(logcmd);
+    }
+
+    if (cmdht) {
+        mzHashTableFree(cmdht);
+    }
+
+    if (params.buffer) {
+        free(params.buffer);
+    }
+
+    if (transfer_list) {
+        free(transfer_list);
+    }
+
+    if (blockdev_filename) {
+        FreeValue(blockdev_filename);
+    }
+
+    if (transfer_list_value) {
+        FreeValue(transfer_list_value);
+    }
+
+    if (new_data_fn) {
+        FreeValue(new_data_fn);
+    }
+
+    if (patch_data_fn) {
+        FreeValue(patch_data_fn);
+    }
+
+    // Only delete the stash if the update cannot be resumed, or it's
+    // a verification run and we created the stash.
+    if (params.isunresumable || (!params.canwrite && params.createdstash)) {
+        DeleteStash(params.stashbase);
+    }
+
+    if (params.stashbase) {
+        free(params.stashbase);
+    }
+
+    return StringValue(rc == 0 ? strdup("t") : strdup(""));
+}
+
+// The transfer list is a text file containing commands to
+// transfer data from one place to another on the target
+// partition.  We parse it and execute the commands in order:
+//
+//    zero [rangeset]
+//      - fill the indicated blocks with zeros
+//
+//    new [rangeset]
+//      - fill the blocks with data read from the new_data file
+//
+//    erase [rangeset]
+//      - mark the given blocks as empty
+//
+//    move <...>
+//    bsdiff <patchstart> <patchlen> <...>
+//    imgdiff <patchstart> <patchlen> <...>
+//      - read the source blocks, apply a patch (or not in the
+//        case of move), write result to target blocks.  bsdiff or
+//        imgdiff specifies the type of patch; move means no patch
+//        at all.
+//
+//        The format of <...> differs between versions 1 and 2;
+//        see the LoadSrcTgtVersion{1,2}() functions for a
+//        description of what's expected.
+//
+//    stash <stash_id> <src_range>
+//      - (version 2+ only) load the given source range and stash
+//        the data in the given slot of the stash table.
+//			V2新增,the given slot of the stash table就是stash_id
+//
+// The creator of the transfer list will guarantee that no block
+// is read (ie, used as the source for a patch or move) after it
+// has been written.
+//
+// In version 2, the creator will guarantee that a given stash is
+// loaded (with a stash command) before it's used in a
+// move/bsdiff/imgdiff command.
+// 创建transfer list时会保证 一个stash在stash命令中的加载 会放在被move/bsdiff/imgdiff命令使用此stash之前
+// v2中,支持一个新命令stash, stash将从source img中读取的数据,保存到
+// 分配的内存"stash table", 随后会 用stash table中刚存储的项去填充
+// source data中丢失的字节位,因为这些字节位在执行move/bsdiff/imgdiff
+// 时是不允许去读的
+// 这会产生更小的升级包,因为我们可以通过把数据存储到别处然后以后使用的方式, 
+// 来到达 按pieces是怎么更新的顺序 来组织
+// 而不是一点都不使用 作为输入的数据来对系统打patch
+//
+// Within one command the source and target ranges may overlap so
+// in general we need to read the entire source into memory before
+// writing anything to the target blocks.
+//
+// All the patch data is concatenated into one patch_data file in
+// the update package.  It must be stored uncompressed because we
+// memory-map it in directly from the archive.  (Since patches are
+// already compressed, we lose very little by not compressing
+// their concatenation.)
+//
+// In version 3, commands that read data from the partition (i.e.
+// move/bsdiff/imgdiff/stash) have one or more additional hashes
+// before the range parameters, which are used to check if the
+// command has already been completed and verify the integrity of
+// the source data.
+// 在V3中,需要从flash分区读取数据的命令(move/bsdiff/imgdiff/stash),
+// 在range参数前有一个或多个hash值(sha1),这些hash值用于检查命令是否
+// 已经完成,并且验证source data的完整性
+
+//L上支持的命令bsdiff,erase,imgdiff,move,new,zero
+//M上增加的命令:stash(v2新增),free(v3新增)
+
+//block_image_verify("/dev/block/bootdevice/by-name/system", package_extract_file("system.transfer.list"), "system.new.dat", "system.patch.dat")
+//block_image_verify("/dev/block/platform/soc.0/f9824900.sdhci/by-name/system", package_extract_file("system.transfer.list"), "system.new.dat", "system.patch.dat")
+Value* BlockImageVerifyFn(const char* name, State* state, int argc, Expr* argv[]) {
+    // Commands which are not tested are set to NULL to skip them completely
+    const Command commands[] = {
+        { "bsdiff",     PerformCommandDiff  },
+        { "erase",      NULL                },
+        { "free",       PerformCommandFree  },
+        { "imgdiff",    PerformCommandDiff  },
+        { "move",       PerformCommandMove  },
+        { "new",        NULL                },
+        { "stash",      PerformCommandStash },
+        { "zero",       NULL                }
+    };
+
+    // Perform a dry run without writing to test if an update can proceed
+    return PerformBlockImageUpdate(name, state, argc, argv, commands,
+                sizeof(commands) / sizeof(commands[0]), 1);
+}
+
+//block_image_update("/dev/block/platform/soc.0/f9824900.sdhci/by-name/system", package_extract_file("system.transfer.list"), "system.new.dat", "system.patch.dat");
+//因此脚本中调用BlockImageUpdateFn时,传给BlockImageUpdateFn的argc是block_image_update的参数个数,
+// argv数组的每个值就是block_image_update的各个参数
+Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]) {
+    const Command commands[] = {
+        { "bsdiff",     PerformCommandDiff  },
+        { "erase",      PerformCommandErase },
+        { "free",       PerformCommandFree  },
+        { "imgdiff",    PerformCommandDiff  },
+        { "move",       PerformCommandMove  },
+        { "new",        PerformCommandNew   },
+        { "stash",      PerformCommandStash },
+        { "zero",       PerformCommandZero  }
+    };
+
+    return PerformBlockImageUpdate(name, state, argc, argv, commands,
+                sizeof(commands) / sizeof(commands[0]), 0);
 }
 
 //if (range_sha1("/dev/block/platform/mtk-msdc.0/11230000.msdc0/by-name/syst
@@ -1105,11 +2134,21 @@ Value* RangeSha1Fn(const char* name, State* state, int argc, Expr* argv[]) {
     int i, j;
     // 在for循环中累计更新这72个区间的hash,累计完后一次性计算sha1
     for (i = 0; i < rs->count; ++i) {
-        check_lseek(fd, (off64_t)rs->pos[i*2] * BLOCKSIZE, SEEK_SET);
+		if (check_lseek(fd, (off64_t)rs->pos[i*2] * BLOCKSIZE, SEEK_SET) == -1) {
+			ErrorAbort(state, "failed to seek %s: %s", blockdev_filename->data,
+				strerror(errno));
+			goto done;
+		}
+
         // 这个for中更新每个区间内所有block的hash
         for (j = rs->pos[i*2]; j < rs->pos[i*2+1]; ++j) {
             //每循环一次读取1个block,并更新hash
-            readblock(fd, buffer, BLOCKSIZE);
+			if (read_all(fd, buffer, BLOCKSIZE) == -1) {
+				ErrorAbort(state, "failed to read %s: %s", blockdev_filename->data,
+					strerror(errno));
+				goto done;
+			}
+
             SHA_update(&ctx, buffer, BLOCKSIZE);
         }
     }
@@ -1130,6 +2169,7 @@ Value* RangeSha1Fn(const char* name, State* state, int argc, Expr* argv[]) {
 }
 
 void RegisterBlockImageFunctions() {
+    RegisterFunction("block_image_verify", BlockImageVerifyFn);
     RegisterFunction("block_image_update", BlockImageUpdateFn);
     RegisterFunction("range_sha1", RangeSha1Fn);
 }
