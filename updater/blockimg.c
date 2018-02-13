@@ -2482,7 +2482,8 @@ static Value* PerformBlockImageUpdate(const char* name, State* state, int argc, 
             goto pbiudone;
         }
 
-        if (stash_max_blocks > 0) {
+        // Initialize stashbase even stash_max_blocks = 0
+        if (stash_max_blocks >= 0) {
             //stash在 版本号>=2 引入,因此要首先在 /cache/recovery/{base}/文件夹 下创建出足够空间
             res = CreateStash(state, stash_max_blocks, blockdev_filename->data,
                     &params.stashbase);
