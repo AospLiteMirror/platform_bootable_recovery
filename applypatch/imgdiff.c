@@ -14,6 +14,24 @@
  * limitations under the License.
  */
 
+//在Ubuntu系统上可以直接通过apt进行安装。
+//sudo apt-get install bsdiff
+//使用方法如下：
+//diff:
+//bsdiff oldfile newfile patch
+//patch:
+//bspatch oldfile newfile patch
+
+//虽然针对普通文件bsdiff/bspatch效率非常高。但对于一些压缩文件，由于压缩前内容非常小的变化会导致压缩后整个二进制文件产生非常巨大的变化，这样patch文件会非常大。如android系统中常用的boot.img/recovery.img，本质上就是一块包含压缩和非压缩数据的二进制文件。 
+// 为了解决这个问题，Android也提供了imgdiff工具（bootable/recovery/applypatch）。在source文件中搜索压缩部分（0x1f8b0800），将其划分成多个小块。
+// 非压缩部分称为normal，直接使用bsdiff生成补丁。
+// gzip压缩部分成为GZIP类型，先将内容解压缩，逐个文件使用bsdiff生成补丁，将这些补丁通过GZIP再压缩到一起。 
+// 最后将各部分的补丁合并到一起添加一个文件头生成最终的补丁文件。
+//在patch时候，同样根据不同的部分使用不同的patch方式，最终合并到一起。Android提供了库libapplypatch和可执行程序applypatch用于补丁操作。
+//目前只支持GZIP压缩格式，我们也可以根据这种思想进行扩展，比如EXT4格式的IMG等等。 
+//另外，source和dest必须划分成同样数量的小块，source/dest 文件中压缩部分必须使用与imgdiff同样的ＧＺＩＰ压缩算法，即使用ｍｉｎｉｚｉｐ进行压缩。
+//另外，根据patch操作所使用的内存大小依赖于source以及patch的大小，根据这种分块的思想，我们可以在diff时将文件划分成一定大小的小块，针对这些小块逐一生成patch，在patch时，也分块进行patch，这样可以减少patch操作的内存使用量，可以将算法应用到一些内存受限设备上。
+
 /*
  * This program constructs binary patches for images -- such as boot.img
  * and recovery.img -- that consist primarily of large chunks of gzipped

@@ -258,7 +258,6 @@ static ssize_t RangeSinkWrite(const uint8_t* data, ssize_t size, void* token) {
  					    SEEK_SET) == -1) {
  				    break;
  			    }
-
             } else {
                 // 说明已经更新完所有block区间, 返回已经写入的数据的大小
                 // we can't write any more; return how many bytes have
@@ -362,6 +361,62 @@ static void* unzip_new_data(void* cookie) {
     return NULL;
 }
 
+// 传入的src为source block的范围,将src表示的范围内的数据读取到buffer中
+static int ReadBlocks(RangeSet* src, uint8_t* buffer, int fd) {
+    int i;
+    size_t p = 0;
+    size_t size;
+
+    if (!src || !buffer) {
+        return -1;
+    }
+
+    // 在这个for中把src rangeset表示的所有block区间的数据读到buffer指向的内存中
+    for (i = 0; i < src->count; ++i) {
+        if (check_lseek(fd, (off64_t) src->pos[i * 2] * BLOCKSIZE, SEEK_SET) == -1) {
+            return -1;
+        }
+
+        size = (src->pos[i * 2 + 1] - src->pos[i * 2]) * BLOCKSIZE;
+
+        //从blockdev_filename->data中取偏移,将读到的内容保存到上面申请的buffer
+        if (read_all(fd, buffer + p, size) == -1) {
+            return -1;
+        }
+
+        p += size;
+    }
+
+    return 0;
+}
+
+// 传入的tgt为target block的范围, 将buffer内的数据写入到tgt表示的范围内的target block
+static int WriteBlocks(RangeSet* tgt, uint8_t* buffer, int fd) {
+    int i;
+    size_t p = 0;
+    size_t size;
+
+    if (!tgt || !buffer) {
+        return -1;
+    }
+
+    for (i = 0; i < tgt->count; ++i) {
+        if (check_lseek(fd, (off64_t) tgt->pos[i * 2] * BLOCKSIZE, SEEK_SET) == -1) {
+            return -1;
+        }
+
+        size = (tgt->pos[i * 2 + 1] - tgt->pos[i * 2]) * BLOCKSIZE;
+
+        if (write_all(fd, buffer + p, size) == -1) {
+            return -1;
+        }
+
+        p += size;
+    }
+
+    return 0;
+}
+
 // Do a source/target load for move/bsdiff/imgdiff in version 1.
 // 'wordsave' is the save_ptr of a strtok_r()-in-progress.  We expect
 // to parse the remainder of the string as:
@@ -376,16 +431,17 @@ static void* unzip_new_data(void* cookie) {
 // 对于stash命令,1 解析按src RangeSet命令后面就没有tgt RangeSet,因此调用时tgt必须传NULL
 // 2 V1的move等将src RangeSet范围的block加载到申请的buffer中,
 // 而V2的stash等将src RangeSet范围的block加载到之前申请的stash table指向的内存中
-static void LoadSrcTgtVersion1(char* wordsave, RangeSet** tgt, int* src_blocks,
+static int LoadSrcTgtVersion1(char** wordsave, RangeSet** tgt, int* src_blocks,
                                uint8_t** buffer, size_t* buffer_alloc, int fd) {
     char* word;
+    int rc;
 
-    word = strtok_r(NULL, " ", &wordsave);
+    word = strtok_r(NULL, " ", wordsave);
     //将2,545836,545840 解析为src的range
     RangeSet* src = parse_range(word);
 
     if (tgt != NULL) {
-        word = strtok_r(NULL, " ", &wordsave);
+        word = strtok_r(NULL, " ", wordsave);
         //将2,545500,545504 解析为tgt的range
         *tgt = parse_range(word);
     }
@@ -395,19 +451,515 @@ static void LoadSrcTgtVersion1(char* wordsave, RangeSet** tgt, int* src_blocks,
     // buffer_alloc保存实际分配成功的内存大小
     // 对于stash命令在保存 加载stash 的buffer,也是在这里完成分配
     allocate(src->size * BLOCKSIZE, buffer, buffer_alloc);
-    size_t p = 0;
-    int i;
-    // 在这个for中把src rangeset表示的所有block区间的数据读到buffer指向的内存中
-    for (i = 0; i < src->count; ++i) {
-        check_lseek(fd, (off64_t)src->pos[i*2] * BLOCKSIZE, SEEK_SET);
-        size_t sz = (src->pos[i*2+1] - src->pos[i*2]) * BLOCKSIZE;
-        //从blockdev_filename->data中取偏移,将读到的内容保存到上面申请的buffer
-        readblock(fd, *buffer+p, sz);
-        p += sz;
+    rc = ReadBlocks(src, *buffer, fd);
+    *src_blocks = src->size;
+
+    free(src);
+    return rc;
+}
+
+// VerifyBlocks用于验证buffer中长度为blocks大小的数据的sha1,是否与期待值expected相同
+// expected为调用VerifyBlocks时传入的sha1值
+static int VerifyBlocks(const char *expected, const uint8_t *buffer,
+                        size_t blocks, int printerror) {
+    char* hexdigest = NULL;
+    int rc = -1;
+    uint8_t digest[SHA_DIGEST_SIZE];
+
+    if (!expected || !buffer) {
+        return rc;
     }
 
-    *src_blocks = src->size;
-    free(src);
+    SHA_hash(buffer, blocks * BLOCKSIZE, digest);
+    hexdigest = PrintSha1(digest);
+
+    if (hexdigest != NULL) {
+        rc = strcmp(expected, hexdigest);
+
+        if (rc != 0 && printerror) {
+            fprintf(stderr, "failed to verify blocks (expected %s, read %s)\n",
+                expected, hexdigest);
+        }
+
+        free(hexdigest);
+    }
+
+    return rc;
+}
+
+static char* GetStashFileName(const char* base, const char* id, const char* postfix) {
+    char* fn;
+    int len;
+    int res;
+
+    if (base == NULL) {
+        return NULL;
+    }
+
+    if (id == NULL) {
+        id = "";
+    }
+
+    if (postfix == NULL) {
+        postfix = "";
+    }
+
+    len = strlen(STASH_DIRECTORY_BASE) + 1 + strlen(base) + 1 + strlen(id) + strlen(postfix) + 1;
+    fn = malloc(len);
+
+    if (fn == NULL) {
+        fprintf(stderr, "failed to malloc %d bytes for fn\n", len);
+        return NULL;
+    }
+
+    //!!执行后fn指向字符串 "/cache/recovery/{哈希值}"
+    res = snprintf(fn, len, STASH_DIRECTORY_BASE "/%s/%s%s", base, id, postfix);
+
+    if (res < 0 || res >= len) {
+        fprintf(stderr, "failed to format file name (return value %d)\n", res);
+        free(fn);
+        return NULL;
+    }
+
+    return fn;
+}
+
+typedef void (*StashCallback)(const char*, void*);
+
++// Does a best effort enumeration of stash files. Ignores possible non-file
++// items in the stash directory and continues despite of errors. Calls the
++// 'callback' function for each file and passes 'data' to the function as a
++// parameter.
+
+// enumeration 列举 枚举
+// EnumerateStash(dirname, DeletePartial, NULL);
+// EnumerateStash(dirname, UpdateFileSize, &size);
+// dirname -- /cache/recovery/{base}
+// callback -- 函数DeletePartial或者UpdateFileSize
++static void EnumerateStash(const char* dirname, StashCallback callback, void* data) {
++    char* fn;
++    DIR* directory;
++    int len;
++    int res;
++    struct dirent* item;
+
++    if (dirname == NULL || callback == NULL) {
++        return;
+     }
++
+     //调用opendir, 因为dirname指向的是一个文件夹
++    directory = opendir(dirname);
++
++    if (directory == NULL) {
++        if (errno != ENOENT) {
++            fprintf(stderr, "failed to opendir %s (errno %d)\n", dirname, errno);
++        }
++        return;
+     }
++
+     //循环处理dirname文件夹下的所有文件和文件夹
++    while ((item = readdir(directory)) != NULL) {
+         //对于不是常规文件的所有情况都直接跳过 DT_REG      This is a regular file.
++        if (item->d_type != DT_REG) {
++            continue;
++        }
++
+         //len这时就是 字符串 "/cache/recovery/{base}/{常规文件的文件名}" 的长度
++        len = strlen(dirname) + 1 + strlen(item->d_name) + 1;
++        fn = malloc(len);
++
++        if (fn == NULL) {
++            fprintf(stderr, "failed to malloc %d bytes for fn\n", len);
++            continue;
++        }
++
+         //fn指向字符串 "/cache/recovery/{base}/{常规文件的文件名}"
++        res = snprintf(fn, len, "%s/%s", dirname, item->d_name);
++
++        if (res < 0 || res >= len) {
++            fprintf(stderr, "failed to format file name (return value %d)\n", res);
++            free(fn);
++            continue;
++        }
++
+         //在PerformBlockImageUpdate中先调用DeletePartial,再调用UpdateFileSize
++        callback(fn, data);
++        free(fn);
+     }
++
++    if (closedir(directory) == -1) {
++        fprintf(stderr, "failed to closedir %s (errno %d)\n", dirname, errno);
+     }
++}
+
++static void UpdateFileSize(const char* fn, void* data) {
++    int* size = (int*) data;
++    struct stat st;
+
++    if (!fn || !data) {
++        return;
++    }
+ 
++    if (stat(fn, &st) == -1) {
++        fprintf(stderr, "failed to stat %s (errno %d)\n", fn, errno);
++        return;
+     }
+ 
++    *size += st.st_size;
++}
+ 
++// Deletes the stash directory and all files in it. Assumes that it only
++// contains files. There is nothing we can do about unlikely, but possible
++// errors, so they are merely logged.
++
++static void DeleteFile(const char* fn, void* data) {
++    if (fn) {
++        fprintf(stderr, "deleting %s\n", fn);
++
++        if (unlink(fn) == -1 && errno != ENOENT) {
++            fprintf(stderr, "failed to unlink %s (errno %d)\n", fn, errno);
++        }
+     }
++}
+
++static void DeletePartial(const char* fn, void* data) {
+     //如果/cache/recovery/{base}/下的文件 的文件名中有".partial",就删除这个文件
++    if (fn && strstr(fn, ".partial") != NULL) {
++        DeleteFile(fn, data);
++    }
++}
+
++static void DeleteStash(const char* base) {
++    char* dirname;
+ 
++    if (base == NULL) {
++        return;
++    }
+ 
++    dirname = GetStashFileName(base, NULL, NULL);
+ 
++    if (dirname == NULL) {
++        return;
+     }
+ 
++    fprintf(stderr, "deleting stash %s\n", base);
++    EnumerateStash(dirname, DeleteFile, NULL);
+ 
++    if (rmdir(dirname) == -1) {
++        if (errno != ENOENT && errno != ENOTDIR) {
++            fprintf(stderr, "failed to rmdir %s (errno %d)\n", dirname, errno);
++        }
+     }
+
++    free(dirname);
++}
+
++static int LoadStash(const char* base, const char* id, int verify, int* blocks, uint8_t** buffer,
++        size_t* buffer_alloc, int printnoent) {
++    char *fn = NULL;
++    int blockcount = 0;
++    int fd = -1;
++    int rc = -1;
++    int res;
++    struct stat st;
++
++    if (!base || !id || !buffer || !buffer_alloc) {
++        goto lsout;
+     }
++    if (!blocks) {
++        blocks = &blockcount;
++    }
+
++    fn = GetStashFileName(base, id, NULL);
+
++    if (fn == NULL) {
++        goto lsout;
+     }
+
++    res = stat(fn, &st);
+
++    if (res == -1) {
++        if (errno != ENOENT || printnoent) {
++            fprintf(stderr, "failed to stat %s (errno %d)\n", fn, errno);
++        }
++        goto lsout;
++    }
+
++    fprintf(stderr, " loading %s\n", fn);
+
++    if ((st.st_size % BLOCKSIZE) != 0) {
++        fprintf(stderr, "%s size %zd not multiple of block size %d", fn, st.st_size, BLOCKSIZE);
++        goto lsout;
++    }
+
++    fd = TEMP_FAILURE_RETRY(open(fn, O_RDONLY));
+
++    if (fd == -1) {
++        fprintf(stderr, "failed to open %s (errno %d)\n", fn, errno);
++        goto lsout;
++    }
+
++    allocate(st.st_size, buffer, buffer_alloc);
+
++    if (read_all(fd, *buffer, st.st_size) == -1) {
++        goto lsout;
++    }
+
++    *blocks = st.st_size / BLOCKSIZE;
+
++    if (verify && VerifyBlocks(id, *buffer, *blocks, 1) != 0) {
++        fprintf(stderr, "unexpected contents in %s\n", fn);
++        DeleteFile(fn, NULL);
++        goto lsout;
++    }
+
++    rc = 0;
+
++lsout:
++    if (fd != -1) {
++        TEMP_FAILURE_RETRY(close(fd));
++    }
+
++    if (fn) {
++        free(fn);
++    }
+ 
++    return rc;
++}
+
++static int WriteStash(const char* base, const char* id, int blocks, uint8_t* buffer,
++        int checkspace) {
++    char *fn = NULL;
++    char *cn = NULL;
++    int fd = -1;
++    int rc = -1;
++    int res;
+ 
++    if (base == NULL || buffer == NULL) {
++        goto wsout;
++    }
+ 
++    if (checkspace && CacheSizeCheck(blocks * BLOCKSIZE) != 0) {
++        fprintf(stderr, "not enough space to write stash\n");
++        goto wsout;
++    }
+ 
++    fn = GetStashFileName(base, id, ".partial");
++    cn = GetStashFileName(base, id, NULL);
+ 
++    if (fn == NULL || cn == NULL) {
++        goto wsout;
++    }
+ 
++    fprintf(stderr, " writing %d blocks to %s\n", blocks, cn);
+
++    fd = TEMP_FAILURE_RETRY(open(fn, O_WRONLY | O_CREAT | O_TRUNC | O_SYNC, STASH_FILE_MODE));
+
++    if (fd == -1) {
++        fprintf(stderr, "failed to create %s (errno %d)\n", fn, errno);
++        goto wsout;
++    }
+ 
++    if (write_all(fd, buffer, blocks * BLOCKSIZE) == -1) {
++        goto wsout;
+     }
+ 
++    if (fsync(fd) == -1) {
++        fprintf(stderr, "failed to fsync %s (errno %d)\n", fn, errno);
++        goto wsout;
++    }
+ 
++    if (rename(fn, cn) == -1) {
++        fprintf(stderr, "failed to rename %s to %s (errno %d)\n", fn, cn, errno);
++        goto wsout;
++    }
+ 
++    rc = 0;
+ 
++wsout:
++    if (fd != -1) {
++        TEMP_FAILURE_RETRY(close(fd));
+     }
+ 
++    if (fn) {
++        free(fn);
+     }
++
++    if (cn) {
++        free(cn);
+     }
+ 
++    return rc;
++}
+
+// Creates a directory for storing stash files and checks if the /cache partition
+// hash enough space for the expected amount of blocks we need to store. Returns
+// >0 if we created the directory, zero if it existed already, and <0 of failure.
+
+// maxblocks -- system.transfer.list文件的第四行
+// blockdev -- "/dev/block/bootdevice/by-name/system" 等分区的设备节点路径
+// base -- blockdev 指向的字符串值 sha加密后的 字符串值
+static int CreateStash(State* state, int maxblocks, const char* blockdev, char** base) {
+    char* dirname = NULL;
+    const uint8_t* digest;
+    int rc = -1;
+    int res;
+    int size = 0;
+    SHA_CTX ctx;
+    struct stat st;
+
+    if (blockdev == NULL || base == NULL) {
+        goto csout;
+    }
+
+    // Stash directory should be different for each partition to avoid conflicts
+    // when updating multiple partitions at the same time, so we use the hash of
+    // the block device name as the base directory
+    SHA_init(&ctx);
+    SHA_update(&ctx, blockdev, strlen(blockdev));
+    digest = SHA_final(&ctx);
+    // *base指向的就是/dev/block/bootdevice/by-name/system 的40位sha加密 字符串
+    // /dev/block/bootdevice/by-name/system -- 2bdde8504898ccfcd2c59f20bb8c9c25f73bb524
+    // "/dev/block/bootdevice/by-name/system" -- b00e5a7238619b2074783d82ba78f2c93f2653f9
+    *base = PrintSha1(digest);
+
+    if (*base == NULL) {
+        goto csout;
+    }
+
+    // dirname 指向字符串 "/cache/recovery/{base}"
+    dirname = GetStashFileName(*base, NULL, NULL);
+
+    if (dirname == NULL) {
+        goto csout;
+    }
+
+    //stat成功返回0,失败返回-1
+    res = stat(dirname, &st);
+
+    // if else的两个分支都处理的是stat失败的情况
+    if (res == -1 && errno != ENOENT) {
+        // 获取/cache/recovery/{base}属性失败, 但失败原因不是因为/cache/recovery/{base}不存在(ENOENT)
+        ErrorAbort(state, "failed to stat %s (errno %d)\n", dirname, errno);
+        goto csout;
+    } else if (res != 0) {
+        //说明stat还是不成功,但失败原因就是/cache/recovery/{base}/文件夹不存在,这种情况下可以自行创建/cache/recovery/{base}
+        fprintf(stderr, "creating stash %s\n", dirname);
+        // mkdir!!! 创建出的/cache/recovery/{base}/是个文件夹,STASH_DIRECTORY_MODE 0700
+        res = mkdir(dirname, STASH_DIRECTORY_MODE);
+
+        if (res != 0) {
+            ErrorAbort(state, "failed to create %s (errno %d)\n", dirname, errno);
+            goto csout;
+        }
+
+        // 在cahce分区分配 maxblocks * BLOCKSIZE 字节大小的空间
+        if (CacheSizeCheck(maxblocks * BLOCKSIZE) != 0) {
+            ErrorAbort(state, "not enough space for stash\n");
+            goto csout;
+        }
+
+        rc = 1; // Created directory
+        goto csout;
+    }
+
+    fprintf(stderr, "using existing stash %s\n", dirname);
+
+    // If the directory already exists, calculate the space already allocated to
+    // stash files and check if there's enough for all required blocks. Delete any
+    // partially completed stash files first.
+    // 如果dirname(/cache/recovery/{base})文件夹已经存在的情况
+    //在DeletePartial中删除/cache/recovery/{base}/下所有文件名中含".partial"的普通文件
+    EnumerateStash(dirname, DeletePartial, NULL);
+    //在UpdateFileSize中计算/cache/recovery/{base}/下所有剩余文件的大小总和(以字节为单位),传给size
+    EnumerateStash(dirname, UpdateFileSize, &size);
+
+    // 计算出cache分区还需要分配的空间大小
+    size = (maxblocks * BLOCKSIZE) - size;
+
+    // 如果cache分区分配 还需要分配的空间大小 失败
+    if (size > 0 && CacheSizeCheck(size) != 0) {
+        ErrorAbort(state, "not enough space for stash (%d more needed)\n", size);
+        goto csout;
+    }
+
+    rc = 0; // Using existing directory
+
+csout:
+    if (dirname) {
+        free(dirname);
+    }
+
+    return rc;
+}
+
+// SaveStash成功返回0,失败返回-1
+static int SaveStash(const char* base, char** wordsave, uint8_t** buffer, size_t* buffer_alloc,
+                      int fd, int usehash, int* isunresumable) {
+    char *id = NULL;
+    int res = -1;
+    int blocks = 0;
+
+    if (!wordsave || !buffer || !buffer_alloc || !isunresumable) {
+        return -1;
+    }
+
+    // 对于v3,这里id就指向字符串"e271f3b2e779da7fb8374624b87bb0137b8a697a"
+    id = strtok_r(NULL, " ", wordsave);
+
+    if (id == NULL) {
+        fprintf(stderr, "missing id field in stash command\n");
+        return -1;
+    }
+
+    //对于v3及以上,因为transfer.list命令参数中增加了可以用来验证的hash值,就调用LoadStash在读取要stash区块时再用hash做验证. hash就保存在id中
+    if (usehash && LoadStash(base, id, 1, &blocks, buffer, buffer_alloc, 0) == 0) {
+        // Stash file already exists and has expected contents. Do not
+        // read from source again, as the source may have been already
+        // overwritten during a previous attempt.
+        return 0;
+    }
+
+    // 对于v1,v2, transfer.list命令参数中没有hash,因此直接加载,就用不到上面得到的id
+    // 对于v3,来到这里说明Stash file不存在或者存在但unexpected contents,因此也需要从src直接加载
+    if (LoadSrcTgtVersion1(wordsave, NULL, &blocks, buffer, buffer_alloc, fd) == -1) {
+        return -1;
+    }
+
+    // 对于v3,在从src直接加载完后还可以利用id(hash值)再验证一次
+    // 如果验证失败,说明src已经被修改. 但需要用到这块src的命令可能修改之前已经执行完了,所以忽略这种错误
+    if (usehash && VerifyBlocks(id, *buffer, blocks, 1) != 0) {
+        // Source blocks have unexpected contents. If we actually need this
+        // data later, this is an unrecoverable error. However, the command
+        // that uses the data may have already completed previously, so the
+        // possible failure will occur during source block verification.
+        fprintf(stderr, "failed to load source blocks for stash %s\n", id);
+        return 0;
+    }
+
+    fprintf(stderr, "stashing %d blocks to %s\n", blocks, id);
+    // 最后将buffer中保存的要stash的数据写入到
+    return WriteStash(base, id, blocks, *buffer, 0);
+}
+
+// FreeStash中将会直接删除/cache/recovery/{hash值} 下暂存的文件
+static int FreeStash(const char* base, const char* id) {
+    char *fn = NULL;
+
+    if (base == NULL || id == NULL) {
+        return -1;
+    }
+
+    fn = GetStashFileName(base, id, NULL);
+
+    if (fn == NULL) {
+        return -1;
+    }
+
+    DeleteFile(fn, NULL);
+    free(fn);
+
+    return 0;
 }
 
 // packed 异常拥挤的
@@ -447,9 +999,8 @@ static void MoveRange(uint8_t* dest, RangeSet* locs, const uint8_t* source) {
 // On return, buffer is filled with the loaded source data (rearranged
 // and combined with stashed data as necessary).  buffer may be
 // reallocated if needed to accommodate the source data.  *tgt is the
-// target RangeSet.  Any stashes required are taken from stash_table
-// and free()'d after being used.
-
+// target RangeSet. Any stashes required are loaded using LoadStash.
+// 任何需要的stash都是调用LoadStash加载的
 
 //Generate version 2 of the block_image_update transfer list format.
 //This improves patch size by a different strategy for dealing with
@@ -469,78 +1020,112 @@ static void MoveRange(uint8_t* dest, RangeSet* locs, const uint8_t* source) {
 //stashed data in RAM or on a scratch disk such as /cache, if available.
 // 这打破了以前的顺序约束,有了这个新增现在B必须在A前面执行
 // stash的实现放在了 执行transfer list中命令来打patch 的代码中
-
-static void LoadSrcTgtVersion2(char* wordsave, RangeSet** tgt, int* src_blocks,
+static int LoadSrcTgtVersion2(char** wordsave, RangeSet** tgt, int* src_blocks,
                                uint8_t** buffer, size_t* buffer_alloc, int fd,
-                               uint8_t** stash_table) {
-    char* word;
+                               const char* stashbase, int* overlap) {
++    char* word;
++    char* colonsave;
++    char* colon;
++    int id;
++    int res;
++    RangeSet* locs;
++    size_t stashalloc = 0;
++    uint8_t* stash = NULL;
 
     // 解析tgt的range
+    //在PerformCommandMove和PerformCommandDiff中调用LoadSrcTgtVersion2之前有RangeSet* tgt = NULL;但这里传入的是tgt的地址,所以tgt肯定 != NULL
     if (tgt != NULL) {
-        word = strtok_r(NULL, " ", &wordsave);
+        word = strtok_r(NULL, " ", wordsave);
         *tgt = parse_range(word);
     }
 
-    word = strtok_r(NULL, " ", &wordsave);
+    //继续根据空格分割,读取src_block_count
+    word = strtok_r(NULL, " ", wordsave);
     // 解析src_block_count,传给src_blocks
     *src_blocks = strtol(word, NULL, 0);
 
     // 先从内存中申请buffer
+    //根据src_blocks的大小分配一段buffer
     allocate(*src_blocks * BLOCKSIZE, buffer, buffer_alloc);
 
-    word = strtok_r(NULL, " ", &wordsave);
+    word = strtok_r(NULL, " ", wordsave);
+    // 对应于move 2,449484,449485 1 - abe57036c22b8c5e4b3bee50ccad5a48ea72c4e3:2,0,1 这种情况,word这时就是"-" 走if的true分支,只从/cache分区的stash文件加载数据
+    // <tgt_range> <src_block_count> - <[stash_id:stash_range] ...>
     if (word[0] == '-' && word[1] == '\0') {
         //  如果src_block_count后有'-', 则'-'后是<[stash_id:stash_range] ...>
         // no source ranges, only stashes
     } else {
+        // word这时就是"6,441913,442079,442080,442248,442249,442937"(src_range), 从source image和stash中都加载数据
         // 如果src_block_count后没有'-', 那么其后面至少有<src_range>,要么是<src_range>,要么是<src_range> <src_loc> <[stash_id:stash_range] ...>
         // 因此先解析src_range
+        //对应于move 2,442249,443273 1024 6,441913,442079,442080,442248,442249,442937 6,0,166,167,335,336,1024 cd4bfd42982ed1a0ebd1efa9e029c618eb681f71:4,166,167,335,336这种情况,
+        //<tgt_range> <src_block_count> <src_range> <src_loc> <[stash_id:stash_range] ...>
+        //word这时就是src_range, "6,441913,442079,442080,442248,442249,442937"
         RangeSet* src = parse_range(word);
+        res = ReadBlocks(src, *buffer, fd);
 
-        size_t p = 0;
-        int i;
-        // for中读取src_range到buffer
-        for (i = 0; i < src->count; ++i) {
-            check_lseek(fd, (off64_t)src->pos[i*2] * BLOCKSIZE, SEEK_SET);
-            size_t sz = (src->pos[i*2+1] - src->pos[i*2]) * BLOCKSIZE;
-            readblock(fd, *buffer+p, sz);
-            p += sz;
-        }
++        if (overlap && tgt) {
++            *overlap = range_overlaps(src, *tgt);
++        }
+
         free(src);
 
-        word = strtok_r(NULL, " ", &wordsave);
++        if (res == -1) {
++            return -1;
++        }
+
+        word = strtok_r(NULL, " ", wordsave);
         if (word == NULL) {
             // 如果src_block_count后只有<src_range>, 因为已经读取src_range到buffer,因此到这里没有什么要做的了
             // 这时函数直接返回.这种情况参数跟V1基本一样,因此函数逻辑跟LoadSrcTgtVersion1很相似,要做的也基本一样
             // no stashes, only source range
-            return;
+            return 0;
         }
 
         // 继续解析<src_loc>
-        RangeSet* locs = parse_range(word);
+        locs = parse_range(word);
         // 因为上面buffer中加载加载的全是source range,       调用MoveRange将source部分重叠区域的数据也移到buffer中对应同样位置中
+        //调整buffer中src_range这段内容的位置为src_loc
         MoveRange(*buffer, locs, *buffer);
+        free(locs);
     }
 
     // 在while循环中解析<src_loc>后面的 <[stash_id:stash_range] ...>
-    while ((word = strtok_r(NULL, " ", &wordsave)) != NULL) {
+    //对于move 2,449484,449485 1 - abe57036c22b8c5e4b3bee50ccad5a48ea72c4e3:2,0,1 格式为(<tgt_range> <src_block_count> - <[stash_id:stash_range] ...>)
+    // 多个[stash_id:stash_range]之间以空格分割,因此这个while循环就是解析最后剩余的所有[stash_id:stash_range],这里的例子只有一个
+    while ((word = strtok_r(NULL, " ", wordsave)) != NULL) {
         // Each word is a an index into the stash table, a colon, and
         // then a rangeset describing where in the source block that
         // stashed data should go.
-        char* colonsave = NULL;
-        char* colon = strtok_r(word, ":", &colonsave);
-        // stash_id: an index into the stash table
-        int stash_id = strtol(colon, NULL, 0);
+        colonsave = NULL;
+        //word指向"abe57036c22b8c5e4b3bee50ccad5a48ea72c4e3:2,0,1",执行后colon指向"abe57036c22b8c5e4b3bee50ccad5a48ea72c4e3" (stash_id)
+        colon = strtok_r(word, ":", &colonsave);
+
+         //这一步先读取/cache/recovery/{stashbase}/{colon}文件内容到&stash指向的内存空间中
++        res = LoadStash(stashbase, colon, 0, NULL, &stash, &stashalloc, 1);
+
++        if (res == -1) {
++            // These source blocks will fail verification if used later, but we
++            // will let the caller decide if this is a fatal failure
++            fprintf(stderr, "failed to load stash %s\n", colon);
++            continue;
++        }
+
         colon = strtok_r(NULL, ":", &colonsave);
         // a rangeset describing where in the source block that stashed data should go
         // 解析出来的位置locs,stashed data最近一次执行stash命令从source lock加载时在source中的位置
-        RangeSet* locs = parse_range(colon);
+        locs = parse_range(colon);
+
         // 将这个stash_id指向的stashed的数据加载到buffer中locs位置
-        MoveRange(*buffer, locs, stash_table[stash_id]);
-        free(stash_table[stash_id]);
-        stash_table[stash_id] = NULL;
+        MoveRange(*buffer, locs, stash);
         free(locs);
     }
+
++    if (stash) {
++        free(stash);
++    }
++
++    return 0;
 }
 
 // Parameters for transfer list command functions
@@ -584,6 +1169,7 @@ typedef struct {
 // If the return value is 0, source blocks have expected content and the command
 // can be performed.
 
+// PerformCommandMove和PerformCommandDiff中调用LoadSrcTgtVersion3时overlap都为0.
 static int LoadSrcTgtVersion3(CommandParameters* params, RangeSet** tgt, int* src_blocks,
 							  int onehash, int* overlap) {
 	char* srchash = NULL;
@@ -953,15 +1539,11 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
         char* style;
         style = strtok_r(line, " ", &wordsave);
 
-		// V1:move [src rangeset] [tgt rangeset] copy data from source blocks to target blocks (no patch needed; rangesets are the same size)
-		// move 2,545836,545840 2,545500,545504
-		// move b569d4f018e1cdda840f427eddc08a57b93d8c2e(sha1加密值,长度为40位) 2,545836,545840 4 2,545500,545504
-        // sha256--64 sha512--128
-		//处理system.transfer.list中的move命令 
+
         if (strcmp("move", style) == 0) {
 	        RangeSet* tgt;
 			int src_blocks;
-			// 执行LoadSrcTgtVersion1或LoadSrcTgtVersion2后,tgt就会保存target的block range信息
+			
 			if (version == 1) {
 				LoadSrcTgtVersion1(wordsave, &tgt, &src_blocks,
 								   &buffer, &buffer_alloc, fd);
@@ -977,13 +1559,12 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
             for (i = 0; i < tgt->count; ++i) {
                 check_lseek(fd, (off64_t)tgt->pos[i*2] * BLOCKSIZE, SEEK_SET);
                 size_t sz = (tgt->pos[i*2+1] - tgt->pos[i*2]) * BLOCKSIZE;
-				//从blockdev_filename->data中取偏移,将buffer中的内容写入blockdev_filename->data
+				
                 writeblock(fd, buffer+p, sz);
                 p += sz;
             }
 
-			//blocks_so_far在 for (line = strtok_r(NULL, "\n", &linesave)循环外面开始前初始化为0
-			// 这里每执行完一次move,就累积这个move指令写入的block个数到blocks_so_far
+			
             blocks_so_far += tgt->size;
 			//total_blocks是从transfer.list第二行读取的值,代表总共要写入的block数目
             fprintf(cmd_pipe, "set_progress %.4f\n", (double)blocks_so_far / total_blocks);
@@ -992,11 +1573,6 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
             free(tgt);
 
 		} else if (strcmp("stash", style) == 0) {
-		    // V2:stash <stash_id> <src_range> (version 2 only) load the given source range and stash the data in the given slot of the stash table.
-            // 每个stash命令的stash_id在后面的bsdiff或imgdiff的<[stash_id:stash_range] ...>部分中一定会再出现,
-            // 这时bsdiff或imgdiff会将每一个解析到的[stash_id:stash_range],从stash table指向的内存中加载到buffer中
-            // V2版只是完全将stash数据加载到内存中,STASH_DIRECTORY_BASE "/cache/recovery"在V3中引入
-		    //stash 379e95f9e04037974674f92db25ce81576d85e64 2,268210,268211
 			word = strtok_r(NULL, " ", &wordsave);
 			int stash_id = strtol(word, NULL, 0);
 			int src_blocks;
@@ -1011,35 +1587,29 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
 								stash_table + stash_id, &stash_alloc, fd);
 
         } else if (strcmp("zero", style) == 0 ||
-        // V1:zero [rangeset] fill the indicated blocks with zeros
-        // V1:erase [rangeset] mark the given blocks as empty
-		//处理zero, 如果定义了DEBUG_ERASE为1, 这时erase mean fill the region with zeroes, 和zero的行为实际一样
-		//zero //30,32770,32825,32827,33307,65535,65536,65538,66018,98303,98304,98306,98361,98363,98843,131071,131072,131074,131554,162907,163840,163842,16///3897,163899,164379,196607,196608,196610,197090,215039,215040
                    (DEBUG_ERASE && strcmp("erase", style) == 0)) {
-		    //得到zero后的30及30个block编号,传给word
+		    
             word = strtok_r(NULL, " ", &wordsave);
-			//将word所有信息解析,保存到tgt结构体中.
+			
             RangeSet* tgt = parse_range(word);
 
-			//tgt->size = 30个block编号组成的15个范围的 (右边-左边) 之和
+			
             printf("  zeroing %d blocks\n", tgt->size);
 
-			//调用allocate, 分配BLOCKSIZE大小的内存给buffer,buffer_alloc保存实际分配成功的内存大小
             allocate(BLOCKSIZE, &buffer, &buffer_alloc);
-			//将buffer指向的BLOCKSIZE大小的这段内存全部写为0
+			
             memset(buffer, 0, BLOCKSIZE);
-			//调用check_lseek取得15个block区间每个范围的左边.
+			
             for (i = 0; i < tgt->count; ++i) {
                 check_lseek(fd, (off64_t)tgt->pos[i*2] * BLOCKSIZE, SEEK_SET);
-				//调用writeblock,向每个block区间写入 这个区间长度 次,每次将大小为BLOCKSIZE的内存块buffer写入到fd
+				
                 for (j = tgt->pos[i*2]; j < tgt->pos[i*2+1]; ++j) {
-					// 由于buffer指向的内存都是0, 因此实现了填0操作.
                     writeblock(fd, buffer, BLOCKSIZE);
                 }
             }
 
             if (style[0] == 'z') {   // "zero" but not "erase"
-                //对于zero命令还要把一共填0的block的数目累加, 计算 total_blocks已经处理 的百分比
+                
                 blocks_so_far += tgt->size;
                 fprintf(cmd_pipe, "set_progress %.4f\n", (double)blocks_so_far / total_blocks);
                 fflush(cmd_pipe);
@@ -1047,16 +1617,10 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
 
             free(tgt);
         } else if (strcmp("new", style) == 0) {
-            // V1:new [rangeset] - fill the blocks with data read from the new_data file
-            // 将rangeset代表的xx个block区间内的所有block,用从system.new.dat中解压出来的数据填充
-            // system.new.dat中保存的是system分区新版本相对于旧版本完全新增的文件 system.patch.dat中保存的是
-            //new //30,0,32770,32825,32827,33307,65535,65536,65538,66018,98303,98304,98306,98361,98363,98843,131071,131072,131074,131554,162907,163840,163842,163897,163899,164379,196607,//196608,196610,197090,215039
-            //$ file system.new.dat
-            // system.new.dat: Linux rev 1.0 ext2 filesystem data, UUID=da594c53-9beb-f85c-85c5-cedf76546f7a, volume name "system" (extents) (large files)
 
-            // word 指向30后所有信息
+            
             word = strtok_r(NULL, " ", &wordsave);
-            // tgt保存30后所有信息
+            
             RangeSet* tgt = parse_range(word);
 
             printf("  writing %d blocks of new data\n", tgt->size);
@@ -1065,12 +1629,11 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
             rss.fd = fd;
             rss.tgt = tgt;
             rss.p_block = 0;
-            // p_remain保存每个block区间block个数
+            
             rss.p_remain = (tgt->pos[1] - tgt->pos[0]) * BLOCKSIZE;
-            // 设置要写入的偏移位置
+            
             check_lseek(fd, (off64_t)tgt->pos[0] * BLOCKSIZE, SEEK_SET);
 
-            // 在new_data_thread子线程中真正完成system.new.dat的解压和把其中数据写入systen分区操作
             pthread_mutex_lock(&nti.mu);
             nti.rss = &rss;
             pthread_cond_broadcast(&nti.cv);
@@ -1079,8 +1642,7 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
             }
             pthread_mutex_unlock(&nti.mu);
 
-            // move,zero,new,imgdiff,bsdiff都要统计实际写入flash的block个数,erase不同统计
-            // 一条命令执行完后统计一次,而不是一条命令内的每个block都逐一统计
+
             blocks_so_far += tgt->size;
             fprintf(cmd_pipe, "set_progress %.4f\n", (double)blocks_so_far / total_blocks);
             fflush(cmd_pipe);
@@ -1199,6 +1761,11 @@ Value* BlockImageUpdateFn(const char* name, State* state, int argc, Expr* argv[]
     return StringValue(success ? strdup("t") : strdup(""));
 }
 
+// V1:move [src rangeset] [tgt rangeset] copy data from source blocks to target blocks (no patch needed; rangesets are the same size)
+// move 2,545836,545840 2,545500,545504
+// move b569d4f018e1cdda840f427eddc08a57b93d8c2e(sha1加密值,长度为40位) 2,545836,545840 4 2,545500,545504
+// sha256--64 sha512--128
+//处理system.transfer.list中的move命令 
 static int PerformCommandMove(CommandParameters* params) {
     int blocks = 0;
     int overlap = 0;
@@ -1210,6 +1777,9 @@ static int PerformCommandMove(CommandParameters* params) {
         goto pcmout;
     }
 
+    // 执行LoadSrcTgtVersion1或LoadSrcTgtVersion2后,tgt就会保存target的block range信息
+    //对于LoadSrcTgtVersion1,LoadSrcTgtVersion2,LoadSrcTgtVersion3, 这三个函数总体上都是将src或stash中的内容复制到内存中开辟的一段buffer中(params->buffer)
+    //都不涉及之后的写入操作, 写入操作在之后根据params->canwrite来选择执行. 对于block_image_verify, params->canwrite为0,因此block_image_verify在执行move时就不会写入
     if (params->version == 1) {
         status = LoadSrcTgtVersion1(&params->cpos, &tgt, &blocks, &params->buffer,
                     &params->bufsize, params->fd);
@@ -1235,6 +1805,7 @@ static int PerformCommandMove(CommandParameters* params) {
         if (status == 0) {
             fprintf(stderr, "  moving %d blocks\n", blocks);
 
+            //从blockdev_filename->data中取偏移,将buffer中的内容写入blockdev_filename->data
             if (WriteBlocks(tgt, params->buffer, params->fd) == -1) {
                 goto pcmout;
             }
@@ -1249,6 +1820,8 @@ static int PerformCommandMove(CommandParameters* params) {
         params->freestash = NULL;
     }
 
+	// params->written在 for (line = strtok_r(NULL, "\n", &linesave)循环外面开始前初始化为0
+	// 这里每执行完一次move,就累积这个move指令写入的block个数到params->written
     params->written += tgt->size;
     rc = 0;
 
@@ -1260,6 +1833,13 @@ pcmout:
     return rc;
 }
 
+// V2:stash <stash_id> <src_range> (version 2 only) load the given source range and stash the data in the given slot of the stash table.
+// 每个stash命令的stash_id在后面的bsdiff或imgdiff的<[stash_id:stash_range] ...>部分中一定会再出现,
+// 这时bsdiff或imgdiff会将每一个解析到的[stash_id:stash_range],从stash table指向的内存中加载到buffer中
+// V2版只是完全将stash数据加载到内存中,STASH_DIRECTORY_BASE "/cache/recovery"在V3中引入
+//stash 379e95f9e04037974674f92db25ce81576d85e64 2,268210,268211
+// stash命令在v2开始出现
+// V3版本: stash e271f3b2e779da7fb8374624b87bb0137b8a697a 2,544916,544917
 static int PerformCommandStash(CommandParameters* params) {
     if (!params) {
         return -1;
@@ -1274,6 +1854,19 @@ static int PerformCommandFree(CommandParameters* params) {
         return -1;
     }
 
+    // 对于BlockImageVerifyFn, params->canwrite为0,因此不会删除/cache/recovery/{hash值} 下暂存的文件
+    // 在performBlockImageUpdate中,CreateStash中如果没有判断没有stash就创建出stash,返回>0.如果已经存在stash返回0
+    if (stash_max_blocks >= 0) {
+        res = CreateStash(state, stash_max_blocks, blockdev_filename->data, &params.stashbase);
+
+        if (res == -1) {
+            goto pbiudone;
+        }
+
+        params.createdstash = res;
+    }
+
+    // 因此在执行free命令时, 如果之前已经创建了stash,就删除.如果stash本身就存在,对于verify不删除,对于update删除
     if (params->createdstash || params->canwrite) {
         return FreeStash(params->stashbase, params->cpos);
     }
@@ -1281,6 +1874,10 @@ static int PerformCommandFree(CommandParameters* params) {
     return 0;
 }
 
+// V1:zero [rangeset] fill the indicated blocks with zeros
+// V1:erase [rangeset] mark the given blocks as empty
+//处理zero, 如果定义了DEBUG_ERASE为1, 这时erase mean fill the region with zeroes, 和zero的行为实际一样
+//zero //30,32770,32825,32827,33307,65535,65536,65538,66018,98303,98304,98306,98361,98363,98843,131071,131072,131074,131554,162907,163840,163842,16///3897,163899,164379,196607,196608,196610,197090,215039,215040
 static int PerformCommandZero(CommandParameters* params) {
     char* range = NULL;
     int i;
@@ -1292,6 +1889,7 @@ static int PerformCommandZero(CommandParameters* params) {
         goto pczout;
     }
 
+    //得到zero后的30及30个block编号,传给range
     range = strtok_r(NULL, " ", &params->cpos);
 
     if (range == NULL) {
@@ -1299,20 +1897,27 @@ static int PerformCommandZero(CommandParameters* params) {
         goto pczout;
     }
 
+    //将word所有信息解析,保存到tgt结构体中.
     tgt = parse_range(range);
 
+    //tgt->size = 30个block编号组成的15个范围的 (右边-左边) 之和
     fprintf(stderr, "  zeroing %d blocks\n", tgt->size);
 
+    //调用allocate, 分配BLOCKSIZE大小的内存给buffer,buffer_alloc保存实际分配成功的内存大小
     allocate(BLOCKSIZE, &params->buffer, &params->bufsize);
+    //将buffer指向的BLOCKSIZE大小的这段内存全部写为0
     memset(params->buffer, 0, BLOCKSIZE);
 
     if (params->canwrite) {
+        //调用check_lseek取得15个block区间每个范围的左边
         for (i = 0; i < tgt->count; ++i) {
             if (check_lseek(params->fd, (off64_t) tgt->pos[i * 2] * BLOCKSIZE, SEEK_SET) == -1) {
                 goto pczout;
             }
 
+            //调用writeblock,向每个block区间写入 这个区间长度 次,每次将大小为BLOCKSIZE的内存块buffer写入到fd
             for (j = tgt->pos[i * 2]; j < tgt->pos[i * 2 + 1]; ++j) {
+                // 由于buffer指向的内存都是0, 因此实现了填0操作.
                 if (write_all(params->fd, params->buffer, BLOCKSIZE) == -1) {
                     goto pczout;
                 }
@@ -1320,7 +1925,8 @@ static int PerformCommandZero(CommandParameters* params) {
         }
     }
 
-    if (params->cmdname[0] == 'z') {
+    if (params->cmdname[0] == 'z') { // "zero" but not "erase"
+        //对于zero命令还要把一共填0的block的数目累加, 计算 total_blocks已经处理 的百分比
         // Update only for the zero command, as the erase command will call
         // this if DEBUG_ERASE is defined.
         params->written += tgt->size;
@@ -1336,6 +1942,12 @@ pczout:
     return rc;
 }
 
+// V1:new [rangeset] - fill the blocks with data read from the new_data file
+// 将rangeset代表的xx个block区间内的所有block,用从system.new.dat中解压出来的数据填充
+// system.new.dat中保存的是system分区新版本相对于旧版本完全新增的文件 system.patch.dat中保存的是
+//new //30,0,32770,32825,32827,33307,65535,65536,65538,66018,98303,98304,98306,98361,98363,98843,131071,131072,131074,131554,162907,163840,163842,163897,163899,164379,196607,//196608,196610,197090,215039
+//$ file system.new.dat
+// system.new.dat: Linux rev 1.0 ext2 filesystem data, UUID=da594c53-9beb-f85c-85c5-cedf76546f7a, volume name "system" (extents) (large files)
 static int PerformCommandNew(CommandParameters* params) {
     char* range = NULL;
     int rc = -1;
@@ -1346,12 +1958,14 @@ static int PerformCommandNew(CommandParameters* params) {
         goto pcnout;
     }
 
+    // range指向30后所有信息
     range = strtok_r(NULL, " ", &params->cpos);
 
     if (range == NULL) {
         goto pcnout;
     }
 
+    // tgt保存30后所有信息
     tgt = parse_range(range);
 
     if (params->canwrite) {
@@ -1360,12 +1974,15 @@ static int PerformCommandNew(CommandParameters* params) {
         rss.fd = params->fd;
         rss.tgt = tgt;
         rss.p_block = 0;
+        // p_remain保存每个block区间block个数
         rss.p_remain = (tgt->pos[1] - tgt->pos[0]) * BLOCKSIZE;
 
+        // 设置要写入的偏移位置
         if (check_lseek(params->fd, (off64_t) tgt->pos[0] * BLOCKSIZE, SEEK_SET) == -1) {
             goto pcnout;
         }
 
+        // 在new_data_thread子线程中真正完成system.new.dat的解压和把其中数据写入systen分区操作
         pthread_mutex_lock(&params->nti.mu);
         params->nti.rss = &rss;
         pthread_cond_broadcast(&params->nti.cv);
@@ -1377,6 +1994,8 @@ static int PerformCommandNew(CommandParameters* params) {
         pthread_mutex_unlock(&params->nti.mu);
     }
 
+    // move,zero,new,imgdiff,bsdiff都要统计实际写入flash的block个数,erase不同统计
+    // 一条命令执行完后统计一次,而不是一条命令内的每个block都逐一统计
     params->written += tgt->size;
     rc = 0;
 
@@ -1421,6 +2040,7 @@ static int PerformCommandDiff(CommandParameters* params) {
 
     // params->cpos执行的就是transfer.list中命令名后面的所有字符串
     logparams = strdup(params->cpos);
+    // value指向字符串"{patchstart}
     value = strtok_r(NULL, " ", &params->cpos);
 
     if (value == NULL) {
@@ -1428,9 +2048,11 @@ static int PerformCommandDiff(CommandParameters* params) {
         goto pcdout;
     }
 
-    //解析得到bsdiff/imgdiff命令的  patch offset参数
+    // 调用strtoul得到patchstart的值,传给offset 
+    // 解析得到bsdiff/imgdiff命令的  patch offset参数
     offset = strtoul(value, NULL, 0);
 
+    // value指向字符串{patchlen}
     value = strtok_r(NULL, " ", &params->cpos);
 
     if (value == NULL) {
@@ -1438,7 +2060,8 @@ static int PerformCommandDiff(CommandParameters* params) {
         goto pcdout;
     }
 
-    //解析得到bsdiff/imgdiff命令的  patch length参数
+    // 解析得到bsdiff/imgdiff命令的  patch length参数
+    // 调用strtoul得到patchlen的值,传给len
     len = strtoul(value, NULL, 0);
 
     if (params->version == 1) {
@@ -1844,6 +2467,7 @@ static Value* PerformBlockImageUpdate(const char* name, State* state, int argc, 
 
     if (params.version >= 2) {
         // Third line is how many stash entries are needed simultaneously
+        //对于system.transfer.list文件的第三行,如果版本号>=2,第三行就是同时需要的stash entry
         // transfer.list从V2开始,第3行为同时并存的stash文件数
         line = strtok_r(NULL, "\n", &linesave);
         fprintf(stderr, "maximum stash entries %s\n", line);
@@ -1859,6 +2483,7 @@ static Value* PerformBlockImageUpdate(const char* name, State* state, int argc, 
         }
 
         if (stash_max_blocks > 0) {
+            //stash在 版本号>=2 引入,因此要首先在 /cache/recovery/{base}/文件夹 下创建出足够空间
             res = CreateStash(state, stash_max_blocks, blockdev_filename->data,
                     &params.stashbase);
 
@@ -1871,10 +2496,12 @@ static Value* PerformBlockImageUpdate(const char* name, State* state, int argc, 
     }
 
     // Build a hash table of the available commands
+    // cmdcount对于BlockImageVerifyFn 和 BlockImageUpdateF都是8,第二个参数也都是NULL
     cmdht = mzHashTableCreate(cmdcount, NULL);
 
     for (i = 0; i < cmdcount; ++i) {
         cmdhash = HashString(commands[i].name);
+        //将Verify或Update支持的命令写入hash表中
         mzHashTableLookup(cmdht, cmdhash, (void*) &commands[i], CompareCommands, true);
     }
 
@@ -1883,7 +2510,9 @@ static Value* PerformBlockImageUpdate(const char* name, State* state, int argc, 
     for (line = strtok_r(NULL, "\n", &linesave); line;
          line = strtok_r(NULL, "\n", &linesave)) {
 
+        // 先调用strdup将每行文本内容保存到logcmd
         logcmd = strdup(line);
+        // params.cmdname保存每行开头的命令名称
         params.cmdname = strtok_r(line, " ", &params.cpos);
 
         if (params.cmdname == NULL) {
@@ -1892,6 +2521,7 @@ static Value* PerformBlockImageUpdate(const char* name, State* state, int argc, 
         }
 
         cmdhash = HashString(params.cmdname);
+        // 在Verify或Update保存的hash表中查找这行开头的命令是否支持
         cmd = (const Command*) mzHashTableLookup(cmdht, cmdhash, params.cmdname,
                                     CompareCommandNames, false);
 
@@ -1900,6 +2530,8 @@ static Value* PerformBlockImageUpdate(const char* name, State* state, int argc, 
             goto pbiudone;
         }
 
+        //对于BlockImageVerifyFn,如果传入的commands数组中name对应的操作函数为NULL,则这里cmd->f就为NULL,所以BlockImageVerifyFn在解析system.transfer.list时就会跳过不支持的命令
+        //对于BlockImageVerifyFn和BlockImageUpdateFn支持的命令,cmd->f就不为NULL,因此cmd->f(&params)就是在这个for循环中执行每行支持的命令
         if (cmd->f != NULL && cmd->f(&params) == -1) {
             fprintf(stderr, "failed to execute command [%s]\n",
                 logcmd ? logcmd : params.cmdname);
@@ -2132,6 +2764,7 @@ Value* RangeSha1Fn(const char* name, State* state, int argc, Expr* argv[]) {
     SHA_init(&ctx);
 
     int i, j;
+    // 在外层循环 block区间 的个数次,从而叠加积累每个区间
     // 在for循环中累计更新这72个区间的hash,累计完后一次性计算sha1
     for (i = 0; i < rs->count; ++i) {
 		if (check_lseek(fd, (off64_t)rs->pos[i*2] * BLOCKSIZE, SEEK_SET) == -1) {
@@ -2141,6 +2774,7 @@ Value* RangeSha1Fn(const char* name, State* state, int argc, Expr* argv[]) {
 		}
 
         // 这个for中更新每个区间内所有block的hash
+        //在里层for循环中处理每个区间,一次读入一个block到buffer并更新ctx, 循环次数为这个block区间的大小
         for (j = rs->pos[i*2]; j < rs->pos[i*2+1]; ++j) {
             //每循环一次读取1个block,并更新hash
 			if (read_all(fd, buffer, BLOCKSIZE) == -1) {
@@ -2152,6 +2786,7 @@ Value* RangeSha1Fn(const char* name, State* state, int argc, Expr* argv[]) {
             SHA_update(&ctx, buffer, BLOCKSIZE);
         }
     }
+    //计算所有block区间叠加起来的sha
     // digest就是最终这72个区间的sha1,range_sha1返回digest的值,在if中和3168346b9a857c0dd0e962e86032bf464a007957比较
     digest = SHA_final(&ctx);
     close(fd);
@@ -2164,6 +2799,7 @@ Value* RangeSha1Fn(const char* name, State* state, int argc, Expr* argv[]) {
         return StringValue(strdup(""));
     } else {
         // 正常情况
+        // 返回Value格式的sha, 返回的value的type字段为VAL_STRING
         return StringValue(PrintSha1(digest));
     }
 }

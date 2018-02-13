@@ -1,0 +1,77 @@
+stash 贮藏 隐藏
+编译ota包脚本时负责向system.transfer.list文件写入内容的实现:
+build/tools/releasetools/blockimgdiff.py中class BlockImageDiff(object)的函数def WriteTransfers(self, prefix)
+
+      # all versions:
+      #   zero <rangeset>
+      #   new <rangeset>
+      #   erase <rangeset>
+      #
+      # version 1:
+      #   bsdiff patchstart patchlen <src rangeset> <tgt rangeset>
+      #   imgdiff patchstart patchlen <src rangeset> <tgt rangeset>
+      #   move <src rangeset> <tgt rangeset>
+      #
+      # version 2:
+      #   bsdiff patchstart patchlen <tgt rangeset> <src_str>
+      #   imgdiff patchstart patchlen <tgt rangeset> <src_str>
+      #   move <tgt rangeset> <src_str>
+      #
+      # version 3:
+      #   bsdiff patchstart patchlen srchash tgthash <tgt rangeset> <src_str>
+      #   imgdiff patchstart patchlen srchash tgthash <tgt rangeset> <src_str>
+      #   move hash <tgt rangeset> <src_str>
+其中的<src_str>的格式为:
+        #   <# blocks> <src ranges>
+        #     OR
+        #   <# blocks> <src ranges> <src locs> <stash refs...>
+        #     OR
+        #   <# blocks> - <stash refs...>
+在WriteTransfers中有写入src_str>的具体实现:
+      if self.version == 1:
+        src_str = xf.src_ranges.to_string_raw()
+      elif self.version >= 2:
+
+        #   <# blocks> <src ranges>
+        #     OR
+        #   <# blocks> <src ranges> <src locs> <stash refs...>
+        #     OR
+        #   <# blocks> - <stash refs...>
+
+        size = xf.src_ranges.size()
+        src_str = [str(size)]
+
+        unstashed_src_ranges = xf.src_ranges
+        mapped_stashes = []
+        for s, sr in xf.use_stash:
+          sid = stashes.pop(s)
+          stashed_blocks -= sr.size()
+          unstashed_src_ranges = unstashed_src_ranges.subtract(sr)
+          sh = self.HashBlocks(self.src, sr)
+          sr = xf.src_ranges.map_within(sr)
+          mapped_stashes.append(sr)
+          if self.version == 2:
+            src_str.append("%d:%s" % (sid, sr.to_string_raw()))
+          else:
+            assert sh in stashes
+            src_str.append("%s:%s" % (sh, sr.to_string_raw()))
+            stashes[sh] -= 1
+            if stashes[sh] == 0:
+              free_string.append("free %s\n" % (sh))
+              stashes.pop(sh)
+          heapq.heappush(free_stash_ids, sid)
+
+        if unstashed_src_ranges:
+          src_str.insert(1, unstashed_src_ranges.to_string_raw())
+          if xf.use_stash:
+            mapped_unstashed = xf.src_ranges.map_within(unstashed_src_ranges)
+            src_str.insert(2, mapped_unstashed.to_string_raw())
+            mapped_stashes.append(mapped_unstashed)
+            self.AssertPartition(RangeSet(data=(0, size)), mapped_stashes)
+        else:
+          src_str.insert(1, "-")
+          self.AssertPartition(RangeSet(data=(0, size)), mapped_stashes)
+
+        src_str = " ".join(src_str)
+
+

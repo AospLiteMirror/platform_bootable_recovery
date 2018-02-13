@@ -89,7 +89,7 @@ int main(int argc, char** argv) {
         return 3;
     }
 
-	//在文件中查找升级脚本这个entry
+	//在文件中查找升级脚本这个entry,从ota zip包中找到升级脚本
     const ZipEntry* script_entry = mzFindZipEntry(&za, SCRIPT_NAME);
     if (script_entry == NULL) {
         printf("failed to find %s in %s\n", SCRIPT_NAME, package_filename);
@@ -98,6 +98,7 @@ int main(int argc, char** argv) {
 
     char* script = malloc(script_entry->uncompLen+1);
 	// 根据升级脚本的实际大小分配一段内存，将升级脚本所有内容读到script中
+    //申请一段内存完整保存解压出来的脚本文件的内容,script指向这段内存地址
     if (!mzReadZipEntry(&za, script_entry, script, script_entry->uncompLen)) {
         printf("failed to read script from package\n");
         return 5;
@@ -106,6 +107,7 @@ int main(int argc, char** argv) {
 
     // Configure edify's functions.
 
+    //RegisterBuiltins定义在recovery\edify\expr.c 通过调用expr.c中的RegisterFunction,将内置的ifelse,abort等函数添加到了全局变量fn_table中,fn_table指向函数表
     RegisterBuiltins();
     RegisterInstallFunctions();
     RegisterBlockImageFunctions();
@@ -117,6 +119,7 @@ int main(int argc, char** argv) {
     Expr* root;
     int error_count = 0;
 	//解析脚本
+    //解析解压到内存中的脚本文件内容,将所有命令保存到root中
     int error = parse_string(script, &root, &error_count);
     if (error != 0 || error_count > 0) {
         printf("%d parse errors\n", error_count);
@@ -156,6 +159,7 @@ int main(int argc, char** argv) {
 	//执行脚本 
 	//char* Evaluate(State* state, Expr* expr)  Evaluate()函数主要是调用了expr的fn()函数，参数expr的类型是Expr
 	//从Expr的定义中可以看到它有一个字段argv，这个字段是Expr指针的指针类型，它实际上会指向一个Expr指针的数组对象，表示Expr对象的所有下一级对象。通过这个字段，脚本解析后得到的所有命令都串接在一起，而且命令的执行函数还会调用Ecaluate()来继续执行argv中的Expr对象，因此，虽然Evaluate()中只调用了root对象的fn()函数，但是实际上会执行脚本中的所有命令。
+    //调用Evaluate执行root中保存的所有命令,通过state传递了updater_info,script
     char* result = Evaluate(&state, root);
     if (result == NULL) {
         if (state.errmsg == NULL) {

@@ -58,6 +58,7 @@ HashTable* mzHashTableCreate(size_t initialSize, HashFreeFunc freeFunc)
     if (pHashTable == NULL)
         return NULL;
 
+    // 如果initialSize=8, 则roundUpPower2计算后tableSize 也为8
     pHashTable->tableSize = roundUpPower2(initialSize);
     pHashTable->numEntries = pHashTable->numDeadEntries = 0;
     pHashTable->freeFunc = freeFunc;
