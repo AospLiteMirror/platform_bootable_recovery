@@ -87,6 +87,7 @@ int LoadFileContents(const char* filename, FileContents* file) {
     return 0;
 }
 
+// 将加载分区内容的前缀具有相应sha1哈希的最小size_n字节。
 // Load the contents of an MTD or EMMC partition into the provided
 // FileContents.  filename should be a string of the form
 // "MTD:<partition_name>:<size_1>:<sha1_1>:<size_2>:<sha1_2>:..."  (or
@@ -532,9 +533,14 @@ int applypatch_check(const char* filename, int num_patches,
     // LoadFileContents is successful.  (Useful for reading
     // partitions, where the filename encodes the sha1s; no need to
     // check them twice.)
+   	// 调用LoadFileContents将文件内容读入内存中,
+    // LoadFileContents不成功进入if,释放读取数据,然后从cache中读取并重新检查，
+    // LoadFileContents成功但传入的sha值个数<=0, 没有要检测是否匹配的hash，跳过if（Useful for reading partitions）
+    // LoadFileContents成功并且传入的sha值个数大于0就FindMatchingPatch继续检查sha, 检查成功就跳过if，检查不成功就继续进入if
     if (LoadFileContents(filename, &file) != 0 ||
         (num_patches > 0 &&
          FindMatchingPatch(file.sha1, patch_sha1_str, num_patches) < 0)) {
+        //不成功的两种情况都先printf
         printf("file \"%s\" doesn't have any of expected "
                "sha1 sums; checking cache\n", filename);
 
@@ -544,6 +550,7 @@ int applypatch_check(const char* filename, int num_patches,
         // exists and matches the sha1 we're looking for, the check still
         // passes.
 
+        //从cache/saved.file读取并重新检查
         if (LoadFileContents(CACHE_TEMP_SOURCE, &file) != 0) {
             printf("failed to load cache file\n");
             return 1;
@@ -639,10 +646,12 @@ int applypatch(const char* source_filename,
                Value* bonus_data) {
     printf("patch %s: ", source_filename);
 
+    // 如果调用applypatch的第二个参数是"-", 表示最终生成的target会覆盖source
     if (target_filename[0] == '-' && target_filename[1] == '\0') {
         target_filename = source_filename;
     }
 
+    //之后target的sha保存在target_sha1这个数组中
     uint8_t target_sha1[SHA_DIGEST_LENGTH];
     if (ParseSha1(target_sha1_str, target_sha1) != 0) {
         printf("failed to parse tgt-sha1 \"%s\"\n", target_sha1_str);
@@ -655,7 +664,11 @@ int applypatch(const char* source_filename,
     const Value* copy_patch_value = NULL;
 
     // We try to load the target file into the source_file object.
+    //先尝试直接将target_filename代表的文件内容读取到上面刚定义的source_file中
     if (LoadFileContents(target_filename, &source_file) == 0) {
+        // 如果读取成功,然后比较sha
+        // 如果sha相同,并且调用applypatch时的target_filename为"-", 这时LoadFileContents就是把source读到了source_file,说明要求在source位置生成target,且要生成的target的sha(target_sha1)与source的sha(source_file.sha1)相同,这时不用做任何工作	//如果sha相同,但调用applypatch时的target_filename不为"-",既然LoadFileContents已经成功,说明调用applypatch时target已经存在,并且它的sha(source_file.sha1)与要求的sha(target_sha1)相同,也不用做任何工作
+        // LoadFileContents如果读取失败
         if (memcmp(source_file.sha1, target_sha1, SHA_DIGEST_LENGTH) == 0) {
             // The early-exit case:  the patch was already applied, this file
             // has the desired hash, nothing for us to do.
@@ -664,6 +677,10 @@ int applypatch(const char* source_filename,
         }
     }
 
+    // 如果上一步读取的target文件在存储设备上还实际不存在(这样就有source_file.data == NULL) 或者
+    // 如果source_file.data != NULL, 但target_filename与source_filename不同,说明target存在且与source不同,这时之前LoadFileContents到source_file的就是真的target而不是source
+    // 两种情况都需要读取source并保存到source_file中.
+    // 如果source_file.data != NULL, 但target_filename与source_filename相同,说明source_file已经是source了,不用重新LoadFileContents
     if (source_file.data.empty() ||
         (target_filename != source_filename &&
          strcmp(target_filename, source_filename) != 0)) {
@@ -673,19 +690,26 @@ int applypatch(const char* source_filename,
         LoadFileContents(source_filename, &source_file);
     }
 
+    // 调用FindMatchingPatch根据source的sha找到patch在patch_sha1_str中的索引赋给to_use
+    // applypatch $WORK_DIR/old.file - $NEW_SHA1 $NEW_SIZE $BAD1_SHA1:$WORK_DIR/foo $OLD_SHA1:$WORK_DIR/patch.bsdiff
     if (!source_file.data.empty()) {
         int to_use = FindMatchingPatch(source_file.sha1, patch_sha1_str, num_patches);
         if (to_use >= 0) {
+            //找到后将patch的内容传给source_patch_value
             source_patch_value = patch_data[to_use];
         }
     }
 
+    //如果source_patch_value 为NULL,说明FindMatchingPatch返回-1,说明patch_sha1_str中匹配不到source的sha(source_file.sha1)
     if (source_patch_value == NULL) {
+        // 继而说明source file is bad,到cache下读取备份
         source_file.data.clear();
         printf("source file is bad; trying copy\n");
 
+        //如果再读取备份失败只能返回
         if (LoadFileContents(CACHE_TEMP_SOURCE, &copy_file) < 0) {
             // fail.
+            //说明根据cache下备份的source也匹配不到patch
             printf("failed to read copy file\n");
             return 1;
         }
@@ -786,6 +810,7 @@ static int GenerateTarget(FileContents* source_file,
     // on the same filesystem as its top-level directory ("/system").
     // We need something that exists for calling statfs().
     std::string target_fs = target_filename;
+    //如果target_filename为/system/app/Foo.apk,提取出"/system"传给target_fs
     auto slash_pos = target_fs.find('/', 1);
     if (slash_pos != std::string::npos) {
         target_fs.resize(slash_pos);
@@ -818,14 +843,18 @@ static int GenerateTarget(FileContents* source_file,
     do {
         // Is there enough room in the target filesystem to hold the patched
         // file?
-
+        // target是分区的例子apply_patch("EMMC:/dev/block/platform/msm_sdcc.1/by-name/modem:46499328:c0fece1211d5392c0d98a29b52a4f8fbf285e8fd:46499328:a1c4aa4560e5a7f71bea30c8c7a6d7f272f66077",
+        //			"-", a1c4aa4560e5a7f71bea30c8c7a6d7f272f66077, 46499328,
+        //			c0fece1211d5392c0d98a29b52a4f8fbf285e8fd, package_extract_file("radio.img.p"));
         if (target_is_partition) {
+            // 如果target是分区,输出先写到/tmp中,再拷贝到目标分区
             // If the target is a partition, we're actually going to
             // write the output to /tmp and then copy it to the
             // partition.  statfs() always returns 0 blocks free for
             // /tmp, so instead we'll just assume that /tmp has enough
             // space to hold the file.
 
+            // 如果target是分区,仍然在cache下写一份拷贝
             // We still write the original source to cache, in case
             // the partition write is interrupted.
             if (MakeFreeSpaceOnCache(source_file->data.size()) < 0) {
@@ -841,10 +870,13 @@ static int GenerateTarget(FileContents* source_file,
         } else {
             int enough_space = 0;
             if (retry > 0) {
+                // 计算出target_fs代表的分区剩余空间大小
                 size_t free_space = FreeSpaceForFile(target_fs.c_str());
+                // free_space 要求> 256K 同时 > target_size 的1.5倍, 就认为有enough_space 
                 enough_space =
                     (free_space > (256 << 10)) &&          // 256k (two-block) minimum
                     (free_space > (target_size * 3 / 2));  // 50% margin of error
+                //如果free_space不满足这个要求, 就不重复retry,只尝试打一次patch
                 if (!enough_space) {
                     printf("target %zu bytes; free space %zu bytes; retry %d; enough %d\n",
                            target_size, free_space, retry, enough_space);
@@ -856,6 +888,7 @@ static int GenerateTarget(FileContents* source_file,
             }
 
             if (!enough_space && source_patch_value != NULL) {
+                //如果target_fs的free_space不满足要求,并且patch数据内容不为空, 先把source拷到cache,再从source原始位置删除source
                 // Using the original source, but not enough free space.  First
                 // copy the source file to cache, then delete it from the original
                 // location.
@@ -865,22 +898,27 @@ static int GenerateTarget(FileContents* source_file,
                     // It's impossible to free space on the target filesystem by
                     // deleting the source if the source is a partition.  If
                     // we're ever in a state where we need to do this, fail.
+                    // 这里意思就是虽然free_space不满足要求,但这种情况属于source是分区
                     printf("not enough free space for target but source is partition\n");
                     return 1;
                 }
 
+                // cache分区先释放空间
                 if (MakeFreeSpaceOnCache(source_file->data.size()) < 0) {
                     printf("not enough free space on /cache\n");
                     return 1;
                 }
 
                 if (SaveFileContents(CACHE_TEMP_SOURCE, source_file) < 0) {
+                    //把source拷贝到cache,命名为cache/saved.file
                     printf("failed to back up source file\n");
                     return 1;
                 }
                 made_copy = 1;
+                //从source原始位置删除source
                 unlink(source_filename);
 
+                // 重新计算target_fs代表的分区剩余空间大小
                 size_t free_space = FreeSpaceForFile(target_fs.c_str());
                 printf("(now %zu bytes free for target) ", free_space);
             }
@@ -892,9 +930,11 @@ static int GenerateTarget(FileContents* source_file,
         int output_fd = -1;
         if (target_is_partition) {
             // We store the decoded output in memory.
+            // 给分区打patch,先在内存中保存生成的target
             sink = MemorySink;
             token = &memory_sink_str;
         } else {
+            //给文件打patch, 将生成的target写入到文件<tgt-file>.patch中
             // We write the decoded output to "<tgt-file>.patch".
             output_fd = ota_open(tmp_target_filename.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_SYNC,
                           S_IRUSR | S_IWUSR);
@@ -904,6 +944,7 @@ static int GenerateTarget(FileContents* source_file,
                 return 1;
             }
             sink = FileSink;
+            //token保存了最终输出的target数据的地址,下面就将token传给了ApplyBSDiffPatch或ApplyImagePatch
             token = &output_fd;
         }
 
@@ -915,6 +956,7 @@ static int GenerateTarget(FileContents* source_file,
             result = ApplyBSDiffPatch(source_to_use->data.data(), source_to_use->data.size(),
                                       patch, 0, sink, token, &ctx);
         } else {
+            // 用imgdiff生成的patch的头标识为IMGDIFF[n] 其中n代表imgdiff的版本
             result = ApplyImagePatch(source_to_use->data.data(), source_to_use->data.size(),
                                      patch, sink, token, &ctx, bonus_data);
         }
@@ -933,6 +975,7 @@ static int GenerateTarget(FileContents* source_file,
         }
 
         if (result != 0) {
+            //ApplyBSDiffPatch 只在成功在返回0
             if (retry == 0) {
                 printf("applying patch failed\n");
                 return result != 0;
@@ -940,6 +983,7 @@ static int GenerateTarget(FileContents* source_file,
                 printf("applying patch failed; retrying\n");
             }
             if (!target_is_partition) {
+                //如果生成target失败,对于target为文件的情况,这时<tgt-file>.patch就是损坏的,没有用处
                 unlink(tmp_target_filename.c_str());
             }
         } else {
@@ -949,6 +993,7 @@ static int GenerateTarget(FileContents* source_file,
     } while (retry-- > 0);
 
     uint8_t current_target_sha1[SHA_DIGEST_LENGTH];
+    //计算出生成target的sha,再和传入的期望值比较
     SHA1_Final(current_target_sha1, &ctx);
     if (memcmp(current_target_sha1, target_sha1, SHA_DIGEST_LENGTH) != 0) {
         printf("patch did not produce expected sha1\n");
@@ -958,6 +1003,7 @@ static int GenerateTarget(FileContents* source_file,
     }
 
     if (target_is_partition) {
+        // target为分区
         // Copy the temp file to the partition.
         if (WriteToPartition(reinterpret_cast<const unsigned char*>(memory_sink_str.c_str()),
                              memory_sink_str.size(), target_filename) != 0) {
@@ -965,6 +1011,7 @@ static int GenerateTarget(FileContents* source_file,
             return 1;
         }
     } else {
+        // target为文件
         // Give the .patch file the same owner, group, and mode of the
         // original source file.
         if (chmod(tmp_target_filename.c_str(), source_to_use->st.st_mode) != 0) {
@@ -985,6 +1032,7 @@ static int GenerateTarget(FileContents* source_file,
 
     // If this run of applypatch created the copy, and we're here, we
     // can delete it.
+    // 如果已经将source拷贝到过cache,生成target成功后就删除/cache/saved.file
     if (made_copy) {
         unlink(CACHE_TEMP_SOURCE);
     }

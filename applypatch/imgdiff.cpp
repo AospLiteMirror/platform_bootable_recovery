@@ -13,6 +13,23 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+//在Ubuntu系统上可以直接通过apt进行安装。
+//sudo apt-get install bsdiff
+//使用方法如下：
+//diff:
+//bsdiff oldfile newfile patch
+//patch:
+//bspatch oldfile newfile patch
+	
+//虽然针对普通文件bsdiff/bspatch效率非常高。但对于一些压缩文件，由于压缩前内容非常小的变化会导致压缩后整个二进制文件产生非常巨大的变化，这样patch文件会非常大。如android系统中常用的boot.img/recovery.img，本质上就是一块包含压缩和非压缩数据的二进制文件。 
+// 为了解决这个问题，Android也提供了imgdiff工具（bootable/recovery/applypatch）。在source文件中搜索压缩部分（0x1f8b0800），将其划分成多个小块。
+// 非压缩部分称为normal，直接使用bsdiff生成补丁。
+// gzip压缩部分成为GZIP类型，先将内容解压缩，逐个文件使用bsdiff生成补丁，将这些补丁通过GZIP再压缩到一起。 
+// 最后将各部分的补丁合并到一起添加一个文件头生成最终的补丁文件。
+//在patch时候，同样根据不同的部分使用不同的patch方式，最终合并到一起。Android提供了库libapplypatch和可执行程序applypatch用于补丁操作。
+//目前只支持GZIP压缩格式，我们也可以根据这种思想进行扩展，比如EXT4格式的IMG等等。 
+//另外，source和dest必须划分成同样数量的小块，source/dest 文件中压缩部分必须使用与imgdiff同样的ＧＺＩＰ压缩算法，即使用ｍｉｎｉｚｉｐ进行压缩。
+//另外，根据patch操作所使用的内存大小依赖于source以及patch的大小，根据这种分块的思想，我们可以在diff时将文件划分成一定大小的小块，针对这些小块逐一生成patch，在patch时，也分块进行patch，这样可以减少patch操作的内存使用量，可以将算法应用到一些内存受限设备上。	
 
 /*
  * This program constructs binary patches for images -- such as boot.img
@@ -21,6 +38,9 @@
  * these files is not useful because small changes in the data lead to
  * large changes in the compressed bitstream; bsdiff patches of gzipped
  * data are typically as large as the data itself.
+ boot.img和recovery.img主要由gzip格式压缩的巨大的chunk和分散在期间的未压缩的数据组成.
+ 由于原始数据的微小变动会导致压缩后的比特流的巨大差异,因此直接用bsdiif对boot.img等做差分
+ 不是很有效.
  *
  * To patch these usefully, we break the source and target images up into
  * chunks of two types: "normal" and "gzip".  Normal chunks are simply
@@ -30,6 +50,12 @@
  * concatenated together to create the output file; the output image
  * should be *exactly* the same series of bytes as the target image used
  * originally to generate the patch.
+ 为了有效生成差分,把source和target image分解为两种类型的chunk,"normal" and "gzip"
+ normal类型的chunk可以直接用bsdiff做差分.gzip类型的chunk先解压,然后用bsdiff对解压后的
+ 数据做差分,然后再对bsdiff得到的差分数据做gzip压缩,压缩参数与gzip类型chunk的压缩参数相同.
+ 所有chunk做差分是是按连接顺序做处理并得到输出文件的,因此输出文件的应该与原来用于生成patch的
+ target image有完全相同的chunk顺序.
+
  *
  * To work well with this tool, the gzipped sections of the target
  * image must have been generated using the same deflate encoder that
@@ -41,6 +67,8 @@
  * An "imgdiff" patch consists of a header describing the chunk structure
  * of the file and any encoding parameters needed for the gzipped
  * chunks, followed by N bsdiff patches, one per chunk.
+// 对于一个imgdiff命令要处理的IMGDIFF格式补丁文件或补丁数据,它里面又包含1个文件头,之后是chunk count个bsdiff格式的补丁
+// 文件头中包含chunk count的大小,描述了这个补丁整体的chunk结构
  *
  * For a diff to be generated, the source and target images must have the
  * same "chunk" structure: that is, the same number of gzipped and normal
@@ -48,6 +76,8 @@
  * consist of five chunks:  a small normal header, a gzipped kernel, a
  * small normal section, a gzipped ramdisk, and finally a small normal
  * footer.
+// 为了生成diff,source和target images必须有相同的chunk结构,即gzip压缩和普通类型的chunk
+// 数目和顺序均相同.
  *
  * Caveats:  we locate gzipped sections within the source and target
  * images by searching for the byte sequence 1f8b0800:  1f8b is the gzip
@@ -59,6 +89,9 @@
  * occur spuriously within a normal chunk to be a problem.)
  *
  *
+// 下面的表格仅仅描述的是IMGDIFF格式补丁文件或补丁数据的文件头的格式
+// chunk count字段后又有chunk count个chunk自身的头
+// 每个chunk头包含哪些字段根据此chunk的type决定
  * The imgdiff patch header looks like this:
  *
  *    "IMGDIFF1"                  (8)   [magic number and version]
@@ -109,8 +142,14 @@
  * compressed data to create the output chunk (so that header contents
  * like the timestamp are recreated exactly).
  *
+// source expanded len是未压缩的source数据的大小
+// target expected len是未压缩的source数据apply了bsdiff格式的patch后的大小
+// target expected len后面的5个参数确定了当压缩已经 生成的patch 的数据时采用的zlib压缩参数
  * After the header there are 'chunk count' bsdiff patches; the offset
  * of each from the beginning of the file is specified in the header.
+// imgdiff输出的整个文件或数据流的文件头完了之后就是chunk count个bsdiff格式的patch.
+// 每个bsdiff格式patch相对imgdiff输出的整个文件或数据流开始的偏移,在此patch在整个文件头中
+// 对应的chunk(头)中定义(即字段bsdiff patch offset)
  *
  * This tool can take an optional file of "bonus data".  This is an
  * extra file of data that is appended to chunk #1 after it is
@@ -120,6 +159,9 @@
  * patches by combining the boot image with recovery ramdisk
  * information that is stored on the system partition.
  */
+// imgdiff可以接收一个可选的"bonus data"文件,这是一个附加的数据文件,压缩后附在
+// chunk1后面,且必须是CHUNK_DEFLATE类型的chunk. 当应用patch时(applypatch -b)此数据文件也必须是
+// 有效的.这是用来减少system分区的recovery-from-boot.p的大小的方法,通过结合boot image和recovery ramdisk的信息
 
 #include <errno.h>
 #include <inttypes.h>
