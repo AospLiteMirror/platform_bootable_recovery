@@ -60,6 +60,16 @@ void ShowBSDiffLicense() {
         );
 }
 
+// 在GenerateTarget中调用ApplyBSDiffPatch:
+// result = ApplyBSDiffPatch(source_to_use->data, source_to_use->size,
+                // patch, 0, sink, token, &ctx);
+// 其中source_to_use->old_data -- old_data -- 指向source的实际数据, 
+// source_to_use->old_size -- old_size -- source实际数据的大小
+// patch -- patch -- 代表patch的数据结构object
+// 0  -- patch_offset -- patch数据再整个patch文件中的偏移,对于bsdiff命令此值为0,对于imgdiff命令此值非0
+// sink -- sink -- ApplyBSDiffPatchMem中在内存中生成了target的数据, 然后调用sink按对文件还是分区打patch的不同方式保存这些数据
+// token -- token -- 最终输出生成target数据的地址
+// ctx -- ctx -- 
 int ApplyBSDiffPatch(const unsigned char* old_data, ssize_t old_size, const Value* patch,
                      ssize_t patch_offset, SinkFn sink, void* token, SHA_CTX* ctx) {
   auto sha_sink = [&](const uint8_t* data, size_t len) {

@@ -77,6 +77,7 @@ int LoadFileContents(const char* filename, FileContents* file) {
   return 0;
 }
 
+// 将加载分区内容的前缀具有相应sha1哈希的最小size_n字节。
 // Load the contents of an EMMC partition into the provided
 // FileContents.  filename should be a string of the form
 // "EMMC:<partition_device>:...".  The smallest size_n bytes for
@@ -406,8 +407,13 @@ int applypatch_check(const char* filename, const std::vector<std::string>& patch
   // LoadFileContents is successful.  (Useful for reading
   // partitions, where the filename encodes the sha1s; no need to
   // check them twice.)
+  // 调用LoadFileContents将文件内容读入内存中,
+  // LoadFileContents不成功进入if,释放读取数据,然后从cache中读取并重新检查，
+  // LoadFileContents成功但传入的sha值个数<=0, 没有要检测是否匹配的hash，跳过if（Useful for reading partitions）
+  // LoadFileContents成功并且传入的sha值个数大于0就FindMatchingPatch继续检查sha, 检查成功就跳过if，检查不成功就继续进入if
   if (LoadFileContents(filename, &file) != 0 ||
       (!patch_sha1_str.empty() && FindMatchingPatch(file.sha1, patch_sha1_str) < 0)) {
+    //不成功的两种情况都先printf
     printf("file \"%s\" doesn't have any of expected sha1 sums; checking cache\n", filename);
 
     // If the source file is missing or corrupted, it might be because
@@ -415,6 +421,7 @@ int applypatch_check(const char* filename, const std::vector<std::string>& patch
     // should have been made in CACHE_TEMP_SOURCE.  If that file
     // exists and matches the sha1 we're looking for, the check still
     // passes.
+    //从cache/saved.file读取并重新检查
     if (LoadFileContents(CACHE_TEMP_SOURCE, &file) != 0) {
       printf("failed to load cache file\n");
       return 1;
@@ -501,6 +508,7 @@ int applypatch(const char* source_filename, const char* target_filename,
                const std::vector<std::unique_ptr<Value>>& patch_data, const Value* bonus_data) {
   printf("patch %s: ", source_filename);
 
+  // 如果调用applypatch的第二个参数是"-", 表示最终生成的target会覆盖source
   if (target_filename[0] == '-' && target_filename[1] == '\0') {
     target_filename = source_filename;
   }
@@ -510,6 +518,7 @@ int applypatch(const char* source_filename, const char* target_filename,
     return 1;
   }
 
+  //之后target的sha保存在target_sha1这个数组中
   uint8_t target_sha1[SHA_DIGEST_LENGTH];
   if (ParseSha1(target_sha1_str, target_sha1) != 0) {
     printf("failed to parse tgt-sha1 \"%s\"\n", target_sha1_str);
@@ -517,8 +526,12 @@ int applypatch(const char* source_filename, const char* target_filename,
   }
 
   // We try to load the target file into the source_file object.
+  //先尝试直接将target_filename代表的文件内容读取到上面刚定义的source_file中.
   FileContents source_file;
   if (LoadFileContents(target_filename, &source_file) == 0) {
+    // 如果读取成功,然后比较sha
+    // 如果sha相同,并且调用applypatch时的target_filename为"-", 这时LoadFileContents就是把source读到了source_file,说明要求在source位置生成target,且要生成的target的sha(target_sha1)与source的sha(source_file.sha1)相同,这时不用做任何工作	//如果sha相同,但调用applypatch时的target_filename不为"-",既然LoadFileContents已经成功,说明调用applypatch时target已经存在,并且它的sha(source_file.sha1)与要求的sha(target_sha1)相同,也不用做任何工作
+    // LoadFileContents如果读取失败
     if (memcmp(source_file.sha1, target_sha1, SHA_DIGEST_LENGTH) == 0) {
       // The early-exit case: the patch was already applied, this file has the desired hash, nothing
       // for us to do.
@@ -527,6 +540,10 @@ int applypatch(const char* source_filename, const char* target_filename,
     }
   }
 
+  // 如果上一步读取的target文件在存储设备上还实际不存在(这样就有source_file.data == NULL) 或者
+  // 如果source_file.data != NULL, 但target_filename与source_filename不同,说明target存在且与source不同,这时之前LoadFileContents到source_file的就是真的target而不是source
+  // 两种情况都需要读取source并保存到source_file中.
+  // 如果source_file.data != NULL, 但target_filename与source_filename相同,说明source_file已经是source了,不用重新LoadFileContents
   if (source_file.data.empty() ||
       (target_filename != source_filename && strcmp(target_filename, source_filename) != 0)) {
     // Need to load the source file: either we failed to load the target file, or we did but it's
@@ -535,9 +552,12 @@ int applypatch(const char* source_filename, const char* target_filename,
     LoadFileContents(source_filename, &source_file);
   }
 
+  // 调用FindMatchingPatch根据source的sha找到patch在patch_sha1_str中的索引赋给to_use
+  // applypatch $WORK_DIR/old.file - $NEW_SHA1 $NEW_SIZE $BAD1_SHA1:$WORK_DIR/foo $OLD_SHA1:$WORK_DIR/patch.bsdiff
   if (!source_file.data.empty()) {
     int to_use = FindMatchingPatch(source_file.sha1, patch_sha1_str);
     if (to_use != -1) {
+      //找到后将patch的内容传给source_patch_value
       return GenerateTarget(source_file, patch_data[to_use], target_filename, target_sha1,
                             bonus_data);
     }
@@ -546,7 +566,9 @@ int applypatch(const char* source_filename, const char* target_filename,
   printf("source file is bad; trying copy\n");
 
   FileContents copy_file;
+  //如果再读取备份失败只能返回
   if (LoadFileContents(CACHE_TEMP_SOURCE, &copy_file) < 0) {
+    //说明根据cache下备份的source也匹配不到patch
     printf("failed to read copy file\n");
     return 1;
   }
